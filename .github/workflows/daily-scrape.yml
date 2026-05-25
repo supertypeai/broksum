@@ -1,0 +1,114 @@
+name: Daily IDX broker scrape
+
+on:
+  schedule:
+    # IPOT publishes broker-summary within ~2h of market close (15:30 WIB).
+    # Run at 11:00 UTC = 18:00 WIB same-day to capture today's data quickly.
+    # Mon-Fri UTC = Mon-Fri 18:00 WIB — covers all 5 trading days same-evening.
+    - cron: '0 11 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Override date (YYYY-MM-DD), leave blank for last trading day'
+        required: false
+      symbol:
+        description: 'Single symbol e.g. PYFA.JK (leave blank for full universe)'
+        required: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore IPOT creds (if secret set)
+        env:
+          IPOT_CREDS_JSON: ${{ secrets.IPOT_CREDS_JSON }}
+        run: |
+          if [ -n "$IPOT_CREDS_JSON" ]; then
+            echo "$IPOT_CREDS_JSON" > ipot_creds.json
+            echo "ipot_creds.json restored ($(wc -c < ipot_creds.json) bytes)"
+          else
+            echo "IPOT_CREDS_JSON secret not set; falling back to IQPlus only"
+          fi
+
+      - name: Scrape
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          ARGS="scrape"
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          fi
+          if [ -n "${{ github.event.inputs.symbol }}" ]; then
+            ARGS="$ARGS --symbol ${{ github.event.inputs.symbol }}"
+          fi
+          echo "Running: python scrape.py $ARGS"
+          python scrape.py $ARGS
+
+      - name: Upload to Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          for f in data/*.csv; do
+            [ -e "$f" ] || continue
+            DATE=$(basename "$f" .csv)
+            python scrape.py upload --date "$DATE"
+          done
+
+      - name: Push rotated IPOT creds back to secret
+        # IPOT rotates the autologintoken on every successful auth. The
+        # in-memory ipot_creds.json was just updated by IPOTSource; persist
+        # it back to the GH secret so the next CI run uses the latest valid
+        # token. Otherwise the next run gets NEEDLOGIN and falls back to
+        # IQPlus.
+        # Requires a PAT with `secrets: write` scope as GH_PAT (default
+        # GITHUB_TOKEN can't update secrets).
+        if: success()
+        env:
+          IPOT_CREDS_JSON: ${{ secrets.IPOT_CREDS_JSON }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "GH_PAT not set; skipping secret rotation. Token will go stale."
+            exit 0
+          fi
+          if [ ! -f ipot_creds.json ]; then
+            echo "no ipot_creds.json to persist (IPOT may have failed)"
+            exit 0
+          fi
+          # Compare normalized JSON content to detect whether IPOT actually
+          # rotated the token this run. Whitespace-tolerant via jq -S.
+          NEW_CANON=$(jq -Sc . ipot_creds.json)
+          OLD_CANON=$(printf '%s' "$IPOT_CREDS_JSON" | jq -Sc .)
+          if [ "$NEW_CANON" = "$OLD_CANON" ]; then
+            echo "ipot_creds.json unchanged; nothing to update"
+            exit 0
+          fi
+          NEW_TOKEN=$(jq -r .autologintoken ipot_creds.json | head -c 12)
+          OLD_TOKEN=$(printf '%s' "$IPOT_CREDS_JSON" | jq -r .autologintoken | head -c 12)
+          echo "Token rotated: ${OLD_TOKEN}... -> ${NEW_TOKEN}..."
+          echo "$GH_PAT" | gh auth login --with-token
+          gh secret set IPOT_CREDS_JSON --body "$(cat ipot_creds.json)"
+          echo "Updated IPOT_CREDS_JSON secret with rotated token"
+
+      - name: Upload CSV artifact (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraped-csv
+          path: data/*.csv
+          retention-days: 7
+          if-no-files-found: ignore

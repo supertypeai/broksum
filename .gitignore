@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[co]
+*.egg-info/
+.venv/
+venv/
+
+# Secrets & env
+.env
+.env.*
+!.env.example
+
+# IPOT auth artifacts (must never be committed)
+ipot_profile/
+ipot_state.json
+ipot_profile_replay/
+ipot_creds.json
+
+# Scrape outputs (ground truth lives in Supabase)
+data/*.csv
+data/*.bak
+
+# Editor / tooling
+.vscode/
+.idea/
+.claude/
+*.swp
+.DS_Store
