@@ -307,6 +307,124 @@ def cmd_upload(args):
 
 
 # ---------------------------------------------------------------------------
+# Registry (one-off scrape of IDX exchange-members profile pages)
+# ---------------------------------------------------------------------------
+
+REGISTRY_CSV_COLUMNS = [
+    "broker_code", "broker_name", "is_foreign", "license_type",
+    "member_status", "source_url",
+]
+
+
+def cmd_registry(args):
+    """Scrape IDX per-broker profile pages, write data/broker_registry.csv."""
+    from sources.idx_members import scrape_members
+
+    client = get_supabase()
+    # Distinct broker codes from one recent trading day in our own broksum data
+    # — every active IDX member touches a liquid stock on a normal trading day,
+    # so a single day's rows give us the full set without paginating the whole
+    # table (PostgREST has no native DISTINCT). Latest day from `latest_date_in_table`.
+    log.info("Finding latest available date in idx_broker_summary_daily ...")
+    latest = (
+        client.table("idx_broker_summary_daily")
+        .select("date")
+        .order("date", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    if not latest:
+        log.error("No data in idx_broker_summary_daily — can't seed registry")
+        return
+    seed_date = latest[0]["date"]
+    log.info(f"  Pulling distinct broker codes from {seed_date} ...")
+
+    codes: set[str] = set()
+    PAGE = 1000
+    from_ = 0
+    while True:
+        data = (
+            client.table("idx_broker_summary_daily")
+            .select("broker_code")
+            .eq("date", seed_date)
+            .range(from_, from_ + PAGE - 1)
+            .execute()
+            .data
+        )
+        if not data:
+            break
+        codes.update(r["broker_code"] for r in data if r.get("broker_code"))
+        if len(data) < PAGE:
+            break
+        from_ += PAGE
+    sorted_codes = sorted(codes)
+    log.info(f"  {len(sorted_codes)} distinct broker codes found")
+
+    if args.limit:
+        sorted_codes = sorted_codes[: args.limit]
+        log.info(f"  --limit {args.limit} applied → scraping {len(sorted_codes)} codes")
+
+    log.info(f"Launching Playwright to scrape IDX profile pages ...")
+    results = scrape_members(sorted_codes)
+
+    DATA_DIR.mkdir(exist_ok=True)
+    out_path = DATA_DIR / "broker_registry.csv"
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=REGISTRY_CSV_COLUMNS)
+        writer.writeheader()
+        for r in results:
+            writer.writerow({
+                "broker_code": r["code"],
+                "broker_name": r["name"] or "",
+                "is_foreign": "true" if r["is_foreign"] else "false",
+                "license_type": r["license_type"] or "",
+                "member_status": "active" if r["ok"] else "unknown",
+                "source_url": r["source_url"],
+            })
+
+    n_ok = sum(1 for r in results if r["ok"])
+    log.info(f"Wrote {out_path} — {n_ok}/{len(results)} brokers with names")
+
+
+def cmd_upload_registry(args):
+    """Upsert data/broker_registry.csv into the Supabase idx_broker_registry table."""
+    client = get_supabase()
+    path = DATA_DIR / "broker_registry.csv"
+    if not path.exists():
+        log.error(f"{path} not found — run `python scrape.py registry` first")
+        return
+
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            if not r["broker_name"]:
+                log.info(f"  skipping {r['broker_code']} — no name scraped")
+                continue
+            rows.append({
+                "broker_code": r["broker_code"],
+                "broker_name": r["broker_name"],
+                "is_foreign": r["is_foreign"].lower() == "true",
+                "license_type": r["license_type"] or None,
+                "member_status": r["member_status"],
+                "source_url": r["source_url"],
+            })
+
+    if not rows:
+        log.info("No usable rows to upload")
+        return
+
+    log.info(f"Upserting {len(rows)} broker_registry rows to Supabase ...")
+    for i in range(0, len(rows), 500):
+        batch = rows[i : i + 500]
+        client.table("idx_broker_registry").upsert(
+            batch, on_conflict="broker_code"
+        ).execute()
+    log.info(f"Upload complete — {len(rows)} rows in idx_broker_registry")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -325,11 +443,26 @@ def main():
     up = sub.add_parser("upload", help="Upload CSVs to Supabase")
     up.add_argument("--date", help="Upload only this date's CSV")
 
+    reg = sub.add_parser(
+        "registry",
+        help="Scrape IDX exchange-members profiles → data/broker_registry.csv",
+    )
+    reg.add_argument("--limit", type=int, help="Max broker codes to scrape (for smoke testing)")
+
+    upreg = sub.add_parser(
+        "upload-registry",
+        help="Upload data/broker_registry.csv to Supabase idx_broker_registry",
+    )
+
     args = parser.parse_args()
     if args.command == "scrape":
         cmd_scrape(args)
     elif args.command == "upload":
         cmd_upload(args)
+    elif args.command == "registry":
+        cmd_registry(args)
+    elif args.command == "upload-registry":
+        cmd_upload_registry(args)
     else:
         parser.print_help()
 
