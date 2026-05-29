@@ -216,6 +216,8 @@ def cmd_scrape(args):
     primary, fallback = _build_sources()
     log.info(f"Primary source: {primary.name}" + (f", fallback: {fallback.name}" if fallback else " (no fallback)"))
 
+    empty_dates: list[str] = []  # dates that produced 0 rows (probe skip or main-loop empty)
+
     try:
         for di, target_date in enumerate(dates, 1):
             date_str = target_date.isoformat()
@@ -243,7 +245,17 @@ def cmd_scrape(args):
                     pass
                 time.sleep(args.delay + random.uniform(0, args.jitter))
             if not probe_rows:
-                log.info(f"  {date_str} — no data from probe tickers, likely holiday, skipping")
+                # Log as both a human-readable warning and a GitHub Actions
+                # `::error::` annotation so the run shows a red callout +
+                # exits non-zero at end (notifications fire per repo settings).
+                # Common causes: real IDX holiday, IPOT auth expired, or
+                # IPOT publish delayed past 18:00 WIB. Verify on idx.co.id.
+                log.error(
+                    f"::error::no data from probe tickers for {date_str}. "
+                    f"Could be a real holiday OR an IPOT outage / auth issue. "
+                    f"Verify on idx.co.id before dismissing."
+                )
+                empty_dates.append(date_str)
                 continue
 
             # Probe rows came from the primary source — keep them. Fetch the rest
@@ -274,11 +286,26 @@ def cmd_scrape(args):
                 src_summary = ", ".join(f"{k}={v}" for k, v in source_counts.items() if v)
                 log.info(f"  {date_str} done — {len(all_rows)} rows → {path} ({failed} failed; sources: {src_summary})")
             else:
-                log.warning(f"  {date_str} — no rows scraped ({failed} failed)")
+                log.error(
+                    f"::error::no rows scraped for {date_str} ({failed} ticker failures). "
+                    f"Source orchestrator returned empty across the board — IPOT + IQPlus both down?"
+                )
+                empty_dates.append(date_str)
     finally:
         primary.close()
         if fallback is not None:
             fallback.close()
+
+    # Fail the run if any date produced 0 rows. This breaks GitHub Actions
+    # green-checkmark silence on false-skip / outage / auth-expired scenarios.
+    # `--allow-empty` overrides (use for explicit backfills of real holidays).
+    if empty_dates and not getattr(args, "allow_empty", False):
+        log.error(
+            f"::error::scrape produced 0 rows for {len(empty_dates)} date(s): {empty_dates}. "
+            f"Exit 1 so GH Actions marks the run as failed. "
+            f"Re-run with --allow-empty if these are confirmed holidays."
+        )
+        raise SystemExit(1)
 
 
 def cmd_upload(args):
@@ -544,6 +571,11 @@ def main():
     sp.add_argument("--limit", type=int, help="Max tickers to process")
     sp.add_argument("--delay", type=float, default=1.0, help="Base delay between requests (s)")
     sp.add_argument("--jitter", type=float, default=0.5, help="Random jitter added to delay (s)")
+    sp.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="Don't exit 1 when a date produces 0 rows (use for backfilling confirmed holidays)",
+    )
 
     up = sub.add_parser("upload", help="Upload CSVs to Supabase")
     up.add_argument("--date", help="Upload only this date's CSV")
