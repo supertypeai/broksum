@@ -227,14 +227,17 @@ def cmd_scrape(args):
 
             log.info(f"[{di}/{len(dates)}] Scraping {date_str} ...")
 
-            # Holiday detection: check 5 liquid tickers first. If all empty, skip.
-            # Always probe via IQPlus — stateless and fast, doesn't burn IPOT auth.
-            iqplus_for_probe = fallback if isinstance(fallback, IQPlusSource) else (primary if isinstance(primary, IQPlusSource) else IQPlusSource())
+            # Holiday detection: check 5 liquid tickers via the primary source.
+            # MUST be primary (IPOT, same-day publish), NOT IQPlus (T+1 publish):
+            # the cron fires at 18:00 WIB same-day, before IQPlus has published
+            # today's data. Using IQPlus here false-flags every trading day as
+            # a holiday and the script silently skips. (Verified May 26-28 2026.)
+            probe_source = primary
             probe_tickers = {"BBCA", "BBRI", "TLKM", "ASII", "BMRI"}
             probe_rows = []
             for pt in probe_tickers:
                 try:
-                    probe = iqplus_for_probe.fetch(pt, date_str)
+                    probe = probe_source.fetch(pt, date_str)
                     probe_rows.extend(probe)
                 except Exception:
                     pass
@@ -243,10 +246,11 @@ def cmd_scrape(args):
                 log.info(f"  {date_str} — no data from probe tickers, likely holiday, skipping")
                 continue
 
-            # Probe rows came from IQPlus — keep them. Fetch the rest via primary.
+            # Probe rows came from the primary source — keep them. Fetch the rest
+            # via fetch_with_fallback so any per-ticker IPOT failure falls back to IQPlus.
             all_rows = list(probe_rows)
             failed = 0
-            source_counts = {primary.name: 0, "IQPlus": len(probe_rows)}
+            source_counts = {primary.name: len(probe_rows)}
 
             for i, symbol in enumerate(symbols, 1):
                 ticker = symbol.replace(".JK", "").upper()
