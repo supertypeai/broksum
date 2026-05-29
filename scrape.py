@@ -394,7 +394,13 @@ def cmd_refresh_cohort(args):
       - foreign broker → always 'institutional'
       - domestic with insufficient activity (<1000 trades / 30d) → 'unknown'
       - domestic with avg lots-per-trade < 100 → 'retail'
-      - domestic with avg lots-per-trade >= 100 → 'institutional'
+      - domestic with 100 <= avg lots-per-trade < 250 → 'mixed'
+      - domestic with avg lots-per-trade >= 250 → 'institutional'
+
+    The 'mixed' bucket captures the reality that most domestic brokers (Mandiri,
+    BCA, BNI, BRI, Bahana, Panin, Trimegah etc.) operate BOTH retail platforms
+    and institutional desks. Pure 'institutional' is reserved for foreign
+    brokers + specialized domestic players that only handle large-ticket orders.
     """
     from datetime import date, timedelta
 
@@ -452,10 +458,14 @@ def cmd_refresh_cohort(args):
         if freq < 1000:
             return "unknown", None
         avg = lots / freq
-        return ("retail" if avg < 100 else "institutional"), avg
+        if avg < 100:
+            return "retail", avg
+        if avg < 250:
+            return "mixed", avg
+        return "institutional", avg
 
     updates = []
-    counts = {"retail": 0, "institutional": 0, "unknown": 0}
+    counts = {"retail": 0, "mixed": 0, "institutional": 0, "unknown": 0}
     for bc, is_foreign in is_foreign_map.items():
         cohort, avg = classify(bc, is_foreign)
         counts[cohort] += 1
