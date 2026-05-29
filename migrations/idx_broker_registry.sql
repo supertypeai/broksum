@@ -35,3 +35,13 @@ create policy "Public read access"
   for select
   to anon, authenticated
   using (true);
+
+-- Cohort classification: retail vs institutional vs unknown, derived from
+-- per-broker activity in idx_broker_summary_daily (avg lots-per-trade over
+-- last 30 days). Foreign brokers are always 'institutional' by definition.
+-- Refreshed via `python scrape.py refresh-cohort` from broksum.
+alter table public.idx_broker_registry
+  add column if not exists cohort text;
+
+comment on column public.idx_broker_registry.cohort is
+  'retail | institutional | unknown. Derived from broksum 30-day activity.';

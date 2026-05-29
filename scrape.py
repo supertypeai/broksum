@@ -387,6 +387,97 @@ def cmd_registry(args):
     log.info(f"Wrote {out_path} — {n_ok}/{len(results)} brokers with names")
 
 
+def cmd_refresh_cohort(args):
+    """Refresh `cohort` column in idx_broker_registry from broksum behavior.
+
+    Classification (last 30 days of activity from idx_broker_summary_daily):
+      - foreign broker → always 'institutional'
+      - domestic with insufficient activity (<1000 trades / 30d) → 'unknown'
+      - domestic with avg lots-per-trade < 100 → 'retail'
+      - domestic with avg lots-per-trade >= 100 → 'institutional'
+    """
+    from datetime import date, timedelta
+
+    client = get_supabase()
+
+    log.info("Pulling broker registry ...")
+    reg_data = (
+        client.table("idx_broker_registry")
+        .select("broker_code,is_foreign")
+        .execute()
+        .data
+    )
+    if not reg_data:
+        log.error("idx_broker_registry is empty — run `python scrape.py registry` first")
+        return
+    is_foreign_map = {r["broker_code"]: bool(r["is_foreign"]) for r in reg_data}
+    log.info(f"  {len(is_foreign_map)} brokers in registry")
+
+    end = date.today()
+    start = end - timedelta(days=30)
+    log.info(f"Pulling broker activity {start} -> {end} ...")
+
+    per_broker: dict[str, dict[str, int]] = {}
+    PAGE = 1000
+    from_ = 0
+    while True:
+        data = (
+            client.table("idx_broker_summary_daily")
+            .select("broker_code,blot,slot,bfreq,sfreq")
+            .gte("date", start.isoformat())
+            .range(from_, from_ + PAGE - 1)
+            .execute()
+            .data
+        )
+        if not data:
+            break
+        for r in data:
+            bc = r.get("broker_code")
+            if not bc:
+                continue
+            agg = per_broker.setdefault(bc, {"lots": 0, "freq": 0})
+            agg["lots"] += (r.get("blot") or 0) + (r.get("slot") or 0)
+            agg["freq"] += (r.get("bfreq") or 0) + (r.get("sfreq") or 0)
+        if len(data) < PAGE:
+            break
+        from_ += PAGE
+    log.info(f"  aggregated {len(per_broker)} brokers from 30-day activity")
+
+    def classify(bc: str, is_foreign: bool) -> tuple[str, float | None]:
+        if is_foreign:
+            return "institutional", None
+        agg = per_broker.get(bc, {"lots": 0, "freq": 0})
+        freq = agg["freq"]
+        lots = agg["lots"]
+        if freq < 1000:
+            return "unknown", None
+        avg = lots / freq
+        return ("retail" if avg < 100 else "institutional"), avg
+
+    updates = []
+    counts = {"retail": 0, "institutional": 0, "unknown": 0}
+    for bc, is_foreign in is_foreign_map.items():
+        cohort, avg = classify(bc, is_foreign)
+        counts[cohort] += 1
+        updates.append((bc, cohort, avg))
+
+    log.info(f"  classification: {counts}")
+
+    log.info("Updating registry ...")
+    for bc, cohort, _ in updates:
+        client.table("idx_broker_registry").update(
+            {"cohort": cohort}
+        ).eq("broker_code", bc).execute()
+    log.info(f"Refreshed cohort for {len(updates)} brokers")
+
+    # Print the borderline cases so user can sanity-check
+    domestics = [(bc, c, a) for bc, c, a in updates if a is not None]
+    domestics.sort(key=lambda x: x[2] or 0)
+    log.info("Domestic brokers ranked by avg lots/trade (lowest first):")
+    for bc, cohort, avg in domestics:
+        log.info(f"  {bc:>3}  avg={avg:>7.1f} lots/trade  → {cohort}")
+
+
 def cmd_upload_registry(args):
     """Upsert data/broker_registry.csv into the Supabase idx_broker_registry table."""
     client = get_supabase()
@@ -454,6 +545,11 @@ def main():
         help="Upload data/broker_registry.csv to Supabase idx_broker_registry",
     )
 
+    rcoh = sub.add_parser(
+        "refresh-cohort",
+        help="Recompute idx_broker_registry.cohort from broksum 30-day activity",
+    )
+
     args = parser.parse_args()
     if args.command == "scrape":
         cmd_scrape(args)
@@ -463,6 +559,8 @@ def main():
         cmd_registry(args)
     elif args.command == "upload-registry":
         cmd_upload_registry(args)
+    elif args.command == "refresh-cohort":
+        cmd_refresh_cohort(args)
     else:
         parser.print_help()
 
