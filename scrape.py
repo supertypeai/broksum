@@ -237,13 +237,20 @@ def cmd_scrape(args):
             probe_source = primary
             probe_tickers = {"BBCA", "BBRI", "TLKM", "ASII", "BMRI"}
             probe_rows = []
+            probe_exceptions = []  # log each failure so empty probe is debuggable
             for pt in probe_tickers:
                 try:
                     probe = probe_source.fetch(pt, date_str)
                     probe_rows.extend(probe)
-                except Exception:
-                    pass
+                except Exception as e:
+                    probe_exceptions.append((pt, type(e).__name__, str(e)[:120]))
                 time.sleep(args.delay + random.uniform(0, args.jitter))
+
+            # If all 5 probes raised, it's almost certainly an auth/network issue,
+            # not a holiday. Surface the exceptions so the GH log isn't silent.
+            if probe_exceptions:
+                for pt, etype, msg in probe_exceptions:
+                    log.warning(f"  probe {pt} {etype}: {msg}")
             if not probe_rows:
                 # Log as both a human-readable warning and a GitHub Actions
                 # `::error::` annotation so the run shows a red callout +
