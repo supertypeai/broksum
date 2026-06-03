@@ -76,7 +76,13 @@ jobs:
         # IQPlus.
         # Requires a PAT with `secrets: write` scope as GH_PAT (default
         # GITHUB_TOKEN can't update secrets).
-        if: success()
+        #
+        # `if: always()` so this still runs when the scrape step exits 1 on
+        # an empty probe day (real holidays). The IPOT auth handshake already
+        # completed before the probe, so the rotated token is valid even
+        # though we got no rows. If we skipped on failure, the next run
+        # would inherit the pre-handshake token and IPOT would reject it.
+        if: always()
         env:
           IPOT_CREDS_JSON: ${{ secrets.IPOT_CREDS_JSON }}
           GH_PAT: ${{ secrets.GH_PAT }}
