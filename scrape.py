@@ -489,21 +489,21 @@ def cmd_refresh_cohort(args):
 
     def classify(bc: str, is_foreign: bool) -> tuple[str, float | None]:
         if is_foreign:
-            return "institutional", None
+            return "Institutional", None
         agg = per_broker.get(bc, {"lots": 0, "freq": 0})
         freq = agg["freq"]
         lots = agg["lots"]
         if freq < 1000:
-            return "unknown", None
+            return "Unknown", None
         avg = lots / freq
         if avg < 100:
-            return "retail", avg
+            return "Retail", avg
         if avg < 250:
-            return "mixed", avg
-        return "institutional", avg
+            return "Mixed", avg
+        return "Institutional", avg
 
     updates = []
-    counts = {"retail": 0, "mixed": 0, "institutional": 0, "unknown": 0}
+    counts = {"Retail": 0, "Mixed": 0, "Institutional": 0, "Unknown": 0}
     for bc, is_foreign in is_foreign_map.items():
         cohort, avg = classify(bc, is_foreign)
         counts[cohort] += 1
@@ -563,6 +563,57 @@ def cmd_upload_registry(args):
     log.info(f"Upload complete — {len(rows)} rows in idx_broker_registry")
 
 
+def cmd_normalize_registry(args):
+    """Re-normalize broker_name, member_status, cohort, and license_type for
+    all rows already in idx_broker_registry. Idempotent — safe to re-run.
+
+    Used when the normalization rules change without needing a full re-scrape.
+    Applies the same _normalize_name / _clean_license helpers as the scraper.
+    """
+    from sources.idx_members import _normalize_name, _clean_license
+
+    client = get_supabase()
+    rows = (
+        client.table("idx_broker_registry")
+        .select("broker_code, broker_name, member_status, cohort, license_type")
+        .execute()
+        .data
+        or []
+    )
+    log.info(f"Fetched {len(rows)} rows from idx_broker_registry")
+
+    cohort_title = {
+        "retail": "Retail",
+        "mixed": "Mixed",
+        "institutional": "Institutional",
+        "unknown": "Unknown",
+    }
+    updates = 0
+    for r in rows:
+        update: dict = {}
+        if r.get("broker_name"):
+            new_name = _normalize_name(r["broker_name"])
+            if new_name != r["broker_name"]:
+                update["broker_name"] = new_name
+        new_status = (r.get("member_status") or "Unknown").strip().capitalize()
+        if new_status != r.get("member_status"):
+            update["member_status"] = new_status
+        cohort_raw = (r.get("cohort") or "").strip().lower()
+        if cohort_raw in cohort_title and cohort_title[cohort_raw] != r.get("cohort"):
+            update["cohort"] = cohort_title[cohort_raw]
+        new_lic = _clean_license(r.get("license_type"))
+        if new_lic != r.get("license_type"):
+            update["license_type"] = new_lic
+        if not update:
+            continue
+        client.table("idx_broker_registry").update(update).eq(
+            "broker_code", r["broker_code"]
+        ).execute()
+        updates += 1
+        log.info(f"  {r['broker_code']}: {update}")
+    log.info(f"Normalized {updates}/{len(rows)} rows")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -603,6 +654,11 @@ def main():
         help="Recompute idx_broker_registry.cohort from broksum 30-day activity",
     )
 
+    sub.add_parser(
+        "normalize-registry",
+        help="Re-normalize broker_name / member_status / cohort / license_type for existing idx_broker_registry rows",
+    )
+
     args = parser.parse_args()
     if args.command == "scrape":
         cmd_scrape(args)
@@ -614,6 +670,8 @@ def main():
         cmd_upload_registry(args)
     elif args.command == "refresh-cohort":
         cmd_refresh_cohort(args)
+    elif args.command == "normalize-registry":
+        cmd_normalize_registry(args)
     else:
         parser.print_help()
 

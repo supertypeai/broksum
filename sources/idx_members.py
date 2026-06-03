@@ -82,6 +82,60 @@ def _extract_name(page) -> Optional[str]:
     return None
 
 
+# Acronyms that must stay uppercase when title-casing a broker name. Drawn from
+# the current IDX broker roster. Add new ones here as needed.
+_NAME_ACRONYMS: frozenset[str] = frozenset({
+    "BCA", "BCS", "BNI", "BPD", "BRI", "BTPN", "MNC",   # Indonesian
+    "CGS", "CIMB", "CLSA", "DBS", "HSBC",               # foreign banks
+    "JP", "JPM", "KB", "KGI", "NH", "OCBC",
+    "PT", "RHB", "TBK", "UBS",                          # company-type / foreign
+})
+
+# Title-case convention: lowercase connector words mid-name. First word always
+# capitalizes regardless (handled separately).
+_LOWERCASE_CONNECTORS: frozenset[str] = frozenset({
+    "and", "of", "the", "for", "in", "on", "at", "to", "&",
+})
+
+
+def _normalize_name(raw: str) -> str:
+    """Title-case a broker name, keeping known acronyms uppercase and
+    connector words ("and", "of", ...) lowercase mid-name.
+
+    IDX returns names in all-caps (e.g. "TUNTUN SEKURITAS INDONESIA"). We
+    rebuild deterministically: split on whitespace, strip all punctuation for
+    the acronym lookup (so "J.P." matches "JP"), lowercase connectors
+    mid-name.
+    """
+    tokens = raw.split()
+    out = []
+    for idx, token in enumerate(tokens):
+        # Strip all punctuation (not just leading/trailing) for the lookup so
+        # "J.P." → "JP" and "T.B.K" → "TBK" both match.
+        stripped = "".join(ch for ch in token if ch.isalnum()).upper()
+        if stripped in _NAME_ACRONYMS:
+            out.append(token.upper())
+        elif idx > 0 and stripped.lower() in _LOWERCASE_CONNECTORS:
+            out.append(stripped.lower())
+        else:
+            out.append(token.capitalize())
+    return " ".join(out)
+
+
+def _clean_license(raw: Optional[str]) -> Optional[str]:
+    """Strip empty items and surrounding commas from a comma-joined license list.
+
+    The IDX page occasionally produces strings like ", Penjamin Emisi Efek, ..."
+    when the first license entry is blank. We split, trim, drop empties, and
+    re-join with ", ".
+    """
+    if not raw:
+        return None
+    items = [item.strip() for item in raw.split(",")]
+    items = [item for item in items if item]
+    return ", ".join(items) if items else None
+
+
 # Parse "Field Name : value" rows out of the visible page text. IDX uses tab or
 # colon separators inconsistently; we accept either.
 _FIELD_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 ()\-/&]+?)\s*[:\t]\s*(.+?)\s*$")
@@ -147,7 +201,7 @@ def scrape_members(codes: list[str]) -> list[dict]:
                 "name": None,
                 "license_type": None,
                 "is_foreign": False,
-                "member_status": "unknown",
+                "member_status": "Unknown",
                 "source_url": url,
                 "ok": False,
             }
@@ -162,7 +216,7 @@ def scrape_members(codes: list[str]) -> list[dict]:
 
                 name = _extract_name(page)
                 if name:
-                    entry["name"] = name
+                    entry["name"] = _normalize_name(name)
                     body = page.inner_text("body")
                     fields = _parse_profile_fields(body)
 
@@ -171,10 +225,9 @@ def scrape_members(codes: list[str]) -> list[dict]:
                     # for PT-incorporated members — can't be used here).
                     entry["is_foreign"] = code in FOREIGN_BROKER_CODES
 
-                    entry["license_type"] = fields.get("license") or None
-                    op_status = fields.get("operational status", "").lower()
-                    if op_status:
-                        entry["member_status"] = op_status
+                    entry["license_type"] = _clean_license(fields.get("license"))
+                    op_status = fields.get("operational status", "").strip()
+                    entry["member_status"] = op_status.capitalize() if op_status else "Unknown"
 
                     entry["ok"] = True
                     log.info(
