@@ -251,6 +251,23 @@ def cmd_scrape(args):
             if probe_exceptions:
                 for pt, etype, msg in probe_exceptions:
                     log.warning(f"  probe {pt} {etype}: {msg}")
+            # Auth-dead detection: if every probe ticker raised IPOTAuthError,
+            # the GH secret holds an invalidated autologintoken. Emit a distinct
+            # ::error:: line so the cron log clearly differentiates "auth broke"
+            # from "holiday". The morning IQPlus backfill will recover the data
+            # tomorrow; token recovery still needs manual auth_bootstrap.py.
+            if (
+                probe_exceptions
+                and len(probe_exceptions) == len(probe_tickers)
+                and all(etype == "IPOTAuthError" for _, etype, _ in probe_exceptions)
+            ):
+                log.error(
+                    "::error::IPOT autologin appears dead "
+                    "(5/5 probes returned NEEDLOGIN). Token recovery needs manual "
+                    "`python auth_bootstrap.py` + `gh secret set IPOT_CREDS_JSON "
+                    "-R supertypeai/broksum --body \"$(cat ipot_creds.json)\"`. "
+                    "Morning IQPlus backfill will fill in this date tomorrow."
+                )
             if not probe_rows:
                 # Log as both a human-readable warning and a GitHub Actions
                 # `::error::` annotation so the run shows a red callout +
@@ -614,6 +631,112 @@ def cmd_normalize_registry(args):
     log.info(f"Normalized {updates}/{len(rows)} rows")
 
 
+def cmd_backfill_iqplus(args):
+    """T+1 IQPlus backfill — fill any gap between idx_broker_summary_daily and
+    idx_daily_data via the auth-less IQPlus source.
+
+    Runs as a separate morning cron so broksum's freshness is decoupled from
+    the IPOT pipeline. Idempotent: when there's no gap (typical case after a
+    healthy evening IPOT run) this is a single SQL query and exit 0.
+    """
+    client = get_supabase()
+
+    # Determine gap: idx_daily_data is the IDX-authoritative trading-day source
+    # (it has data for every IDX trading day). Compare against our latest broker
+    # summary row.
+    broksum_max_resp = (
+        client.table("idx_broker_summary_daily")
+        .select("date")
+        .order("date", desc=True)
+        .limit(1)
+        .execute()
+    )
+    daily_max_resp = (
+        client.table("idx_daily_data")
+        .select("date")
+        .order("date", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if not broksum_max_resp.data or not daily_max_resp.data:
+        log.error("::error::could not read max(date) from one of the source tables")
+        raise SystemExit(1)
+
+    broksum_max = date.fromisoformat(broksum_max_resp.data[0]["date"])
+    daily_max = date.fromisoformat(daily_max_resp.data[0]["date"])
+    log.info(f"idx_broker_summary_daily latest: {broksum_max}")
+    log.info(f"idx_daily_data latest:           {daily_max}")
+
+    if broksum_max >= daily_max:
+        log.info("Nothing to backfill — broksum is current.")
+        return
+
+    # Trading days strictly after broksum_max, up to and including daily_max.
+    start = broksum_max + timedelta(days=1)
+    missing = trading_days_in_range(start, daily_max)
+    if not missing:
+        log.info("Gap exists but no trading days in it — nothing to backfill.")
+        return
+    log.info(f"Backfilling {len(missing)} trading day(s): {missing[0]} → {missing[-1]}")
+
+    # Symbol universe (same as cmd_scrape)
+    symbols_resp = client.table("idx_company_profile").select("symbol").execute()
+    symbols = sorted(r["symbol"] for r in symbols_resp.data)
+    log.info(f"{len(symbols)} symbols to scrape per day")
+
+    DATA_DIR.mkdir(exist_ok=True)
+    iqplus = IQPlusSource()
+    empty_dates: list[str] = []
+    delay = getattr(args, "delay", 1.0)
+    jitter = getattr(args, "jitter", 0.5)
+
+    try:
+        for di, target_date in enumerate(missing, 1):
+            date_str = target_date.isoformat()
+            csv_path = DATA_DIR / f"{date_str}.csv"
+            if csv_path.exists():
+                log.info(f"[{di}/{len(missing)}] {date_str} — CSV exists, skipping")
+                continue
+
+            log.info(f"[{di}/{len(missing)}] Backfilling {date_str} via IQPlus ...")
+            all_rows: list[dict] = []
+            failed = 0
+            for i, symbol in enumerate(symbols, 1):
+                ticker = symbol.replace(".JK", "").upper()
+                try:
+                    rows = iqplus.fetch(ticker, date_str)
+                    if rows:
+                        all_rows.extend(rows)
+                    else:
+                        failed += 1
+                except Exception as e:
+                    failed += 1
+                    log.warning(f"  {ticker}: IQPlus failed: {e}")
+                if i % 50 == 0:
+                    log.info(f"  [{i}/{len(symbols)}] {len(all_rows)} rows so far, {failed} failed")
+                time.sleep(delay + random.uniform(0, jitter))
+
+            if all_rows:
+                path = write_csv(date_str, all_rows)
+                log.info(f"  {date_str} done — {len(all_rows)} rows → {path} ({failed} ticker failures)")
+            else:
+                log.error(
+                    f"::error::no rows from IQPlus for {date_str} ({failed} ticker failures). "
+                    f"Could be a real holiday OR an IQPlus outage."
+                )
+                empty_dates.append(date_str)
+    finally:
+        iqplus.close() if hasattr(iqplus, "close") else None
+
+    if empty_dates and not getattr(args, "allow_empty", False):
+        log.error(
+            f"::error::backfill produced 0 rows for {len(empty_dates)} date(s): {empty_dates}. "
+            f"Re-run with --allow-empty if these are confirmed holidays."
+        )
+        raise SystemExit(1)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -659,6 +782,18 @@ def main():
         help="Re-normalize broker_name / member_status / cohort / license_type for existing idx_broker_registry rows",
     )
 
+    bfi = sub.add_parser(
+        "backfill-iqplus",
+        help="T+1 IQPlus backfill: fill the gap between broksum and idx_daily_data via the auth-less IQPlus source",
+    )
+    bfi.add_argument("--delay", type=float, default=1.0, help="Base delay between requests (s)")
+    bfi.add_argument("--jitter", type=float, default=0.5, help="Random jitter added to delay (s)")
+    bfi.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="Don't exit 1 when a date produces 0 rows (use for confirmed holidays)",
+    )
+
     args = parser.parse_args()
     if args.command == "scrape":
         cmd_scrape(args)
@@ -672,6 +807,8 @@ def main():
         cmd_refresh_cohort(args)
     elif args.command == "normalize-registry":
         cmd_normalize_registry(args)
+    elif args.command == "backfill-iqplus":
+        cmd_backfill_iqplus(args)
     else:
         parser.print_help()
 
