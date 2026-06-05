@@ -1,0 +1,53 @@
+name: Morning IQPlus backfill
+
+on:
+  schedule:
+    # 01:00 UTC = 08:00 WIB, Tue-Sat. Runs after IQPlus has published the
+    # prior trading day's data (their site updates overnight WIB), and far
+    # enough after the evening IPOT cron at 11:00 UTC = 18:00 WIB that this
+    # only kicks in for gaps the evening pipeline failed to close.
+    # Idempotent: a single SQL query and exit 0 when broksum is current.
+    - cron: '0 1 * * 2-6'
+  workflow_dispatch: {}
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill via IQPlus
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python scrape.py backfill-iqplus
+
+      - name: Upload CSVs to Supabase
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          for f in data/*.csv; do
+            [ -e "$f" ] || continue
+            DATE=$(basename "$f" .csv)
+            python scrape.py upload --date "$DATE"
+          done
+
+      - name: Upload CSV artifact (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backfilled-csv
+          path: data/*.csv
+          retention-days: 7
+          if-no-files-found: ignore
