@@ -5,7 +5,7 @@ import logging
 import requests
 from bs4 import BeautifulSoup
 
-from . import derive_avg
+from . import derive_avg, winning_avg
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +82,8 @@ class IQPlusSource:
             nlot = _parse_number(tds[8].get_text(strip=True))
             nval = _parse_number(tds[9].get_text(strip=True))
 
+            bavg = derive_avg(bval, blot)
+            savg = derive_avg(sval, slot)
             rows.append({
                 "symbol": f"{ticker.upper()}.JK",
                 "date": date_str,
@@ -89,17 +91,14 @@ class IQPlusSource:
                 "bfreq": bfreq,
                 "blot": blot,
                 "bval": bval,
-                "bavg_per_share": derive_avg(bval, blot),
+                "bavg_per_share": bavg,
                 "sfreq": sfreq,
                 "slot": slot,
                 "sval": sval,
-                "savg_per_share": derive_avg(sval, slot),
+                "savg_per_share": savg,
                 "nlot": nlot,
                 "nval": nval,
-                "navg_per_share": derive_avg(
-                    abs(nval) if nval else None,
-                    abs(nlot) if nlot else None,
-                ),
+                "navg_per_share": winning_avg(nval, bavg, savg),
             })
         return rows
 

@@ -19,7 +19,21 @@ def derive_avg(val, lot):
     return round(val / (lot * 100), 4)
 
 
+def winning_avg(nval, bavg, savg):
+    """Securities-display convention for net avg price per share: show the
+    winning side's avg. Net buyer -> buy avg. Net seller -> sell avg.
+
+    Matches IPOT / Stockbit / RTI display. The natural-looking
+    `|nval| / (|nlot| * 100)` blows up when buy and sell sides are close in
+    volume but differ in price (tiny residual / non-tiny residual value
+    produces absurd per-share numbers, e.g. 6391 for a stock trading at 3247).
+    """
+    if nval is None or nval == 0:
+        return None
+    return bavg if nval > 0 else savg
+
+
 from .iqplus import IQPlusSource
 from .ipot import IPOTSource
 
-__all__ = ["IQPlusSource", "IPOTSource", "CSV_COLUMNS", "derive_avg"]
+__all__ = ["IQPlusSource", "IPOTSource", "CSV_COLUMNS", "derive_avg", "winning_avg"]
