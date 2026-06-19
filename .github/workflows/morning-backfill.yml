@@ -1,13 +1,10 @@
 name: Morning IQPlus backfill
 
 on:
-  schedule:
-    # 01:00 UTC = 08:00 WIB, Tue-Sat. Runs after IQPlus has published the
-    # prior trading day's data (their site updates overnight WIB), and far
-    # enough after the evening IPOT cron at 11:00 UTC = 18:00 WIB that this
-    # only kicks in for gaps the evening pipeline failed to close.
-    # Idempotent: a single SQL query and exit 0 when broksum is current.
-    - cron: '0 1 * * 2-6'
+  # Scheduled trigger lives in cron-job.org (calls workflow_dispatch via GitHub REST API).
+  # Drift on the evening daily-scrape sometimes ran into the next morning, so this
+  # backfill has to fire reliably at 08:00 WIB Tue-Sat — GH Actions cron drift made
+  # that unreliable. Idempotent: SQL no-op when broksum is already current.
   workflow_dispatch: {}
 
 jobs:

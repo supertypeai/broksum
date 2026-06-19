@@ -1,11 +1,11 @@
 name: Daily IDX broker scrape
 
 on:
-  schedule:
-    # IPOT publishes broker-summary within ~2h of market close (15:30 WIB).
-    # Run at 11:00 UTC = 18:00 WIB same-day to capture today's data quickly.
-    # Mon-Fri UTC = Mon-Fri 18:00 WIB — covers all 5 trading days same-evening.
-    - cron: '0 11 * * 1-5'
+  # Scheduled trigger lives in cron-job.org (calls workflow_dispatch via GitHub REST API).
+  # GH Actions cron suffered 5h+ queue drift; cron-job.org gives sub-minute precision.
+  # This race was the root cause of the Jun-15 broker post showing Jun-12 data —
+  # the scrape drifted to ~23:11 WIB while broker_social fired at 23:23, before
+  # the day's broker data finished landing.
   workflow_dispatch:
     inputs:
       date:
