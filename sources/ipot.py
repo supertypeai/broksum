@@ -69,8 +69,13 @@ class IPOTSource:
         """Compatibility no-op; auth is lazy via _ensure_authenticated."""
         self._ensure_authenticated()
 
-    def fetch(self, ticker: str, date_str: str) -> list[dict]:
-        """Fetch all broker rows for ticker on date.
+    def fetch(
+        self,
+        ticker: str,
+        date_str: str,
+        investor_type: str = "%",
+    ) -> list[dict]:
+        """Fetch broker rows for one investor type on a date.
 
         date_str is 'YYYY-MM-DD'. Reformatted to IPOT's 'YYYY-M-DD' (no zero-pad).
         """
@@ -78,15 +83,21 @@ class IPOTSource:
         y, m, d = date_str.split("-")
         ipot_date = f"{int(y)}-{int(m)}-{int(d)}"
 
-        records = self._conn.send_request(
-            service="midata",
-            cmd="query",
-            param={
-                "source": "datafeed",
-                "index": "en_qu_top_bs",
-                "args": ["b", ticker.upper(), "", "RG", "%", ipot_date, ipot_date],
-            },
-        )
+        try:
+            records = self._conn.send_request(
+                service="midata",
+                cmd="query",
+                param={
+                    "source": "datafeed",
+                    "index": "en_qu_top_bs",
+                    "args": ["b", ticker.upper(), "", "RG", investor_type, ipot_date, ipot_date],
+                },
+            )            
+        except RuntimeError as error:
+            if str(error) != "RPC failed: NODATA":
+                raise
+            return []
+
         return self._parse_rows(ticker, date_str, records)
 
     @staticmethod

@@ -25,7 +25,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from supabase import create_client
 
-from sources import CSV_COLUMNS, IPOTSource, IQPlusSource
+from sources import CSV_COLUMNS, IPOTSource, IQPlusSource, derive_avg
 
 load_dotenv()
 
@@ -38,6 +38,15 @@ log = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent / "data"
 RETRY_DELAYS = [5, 15, 45]
+INTEGER_COLUMNS = (
+    "bfreq", "blot", "bval", "sfreq", "slot", "sval", "nlot", "nval",
+    "f_bfreq", "f_blot", "f_bval", "f_sfreq", "f_slot", "f_sval",
+)
+AVERAGE_COLUMNS = (
+    "bavg_per_share", "savg_per_share", "navg_per_share",
+    "f_bavg_per_share", "d_bavg_per_share",
+    "f_savg_per_share", "d_savg_per_share",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -59,12 +68,14 @@ def read_csv(path: Path) -> list[dict]:
         reader = csv.DictReader(f)
         rows = []
         for r in reader:
-            for col in ("bfreq", "blot", "bval", "sfreq", "slot", "sval", "nlot", "nval"):
-                r[col] = int(r[col]) if r[col] else None
-            for col in ("bavg_per_share", "savg_per_share", "navg_per_share"):
-                r[col] = float(r[col]) if r[col] else None
+            for col in INTEGER_COLUMNS:
+                if col in r:
+                    r[col] = int(r[col]) if r[col] else None
+            for col in AVERAGE_COLUMNS:
+                if col in r:
+                    r[col] = float(r[col]) if r[col] else None
             rows.append(r)
-        return rows
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +192,77 @@ def fetch_with_fallback(primary, fallback, ticker, date_str):
     return [], None
 
 
+def add_foreign_and_domestic_rows(
+    all_rows: list[dict],
+    foreign_rows: list[dict],
+) -> list[dict]:
+    foreign_by_broker_code = {
+        foreign_row["broker_code"]: foreign_row
+        for foreign_row in foreign_rows
+    }
+
+    enriched_rows = []
+
+    for all_row in all_rows:
+        foreign_row = foreign_by_broker_code.get(all_row["broker_code"])
+        enriched_row = dict(all_row)
+
+        if foreign_row is not None:
+            enriched_row.update({
+                "f_bfreq": foreign_row["bfreq"],
+                "f_blot": foreign_row["blot"],
+                "f_bval": foreign_row["bval"],
+                "f_bavg_per_share": foreign_row["bavg_per_share"],
+                "f_sfreq": foreign_row["sfreq"],
+                "f_slot": foreign_row["slot"],
+                "f_sval": foreign_row["sval"],
+                "f_savg_per_share": foreign_row["savg_per_share"],
+            })
+
+        else:
+            enriched_row.update({
+                "f_bfreq": None,
+                "f_blot": None,
+                "f_bval": None,
+                "f_bavg_per_share": None,
+                "f_sfreq": None,
+                "f_slot": None,
+                "f_sval": None,
+                "f_savg_per_share": None,
+            })
+
+        domestic_blot = all_row["blot"] - (foreign_row["blot"] if foreign_row else 0)
+        domestic_bval = all_row["bval"] - (foreign_row["bval"] if foreign_row else 0)
+        domestic_slot = all_row["slot"] - (foreign_row["slot"] if foreign_row else 0)
+        domestic_sval = all_row["sval"] - (foreign_row["sval"] if foreign_row else 0)
+        enriched_row["d_bavg_per_share"] = derive_avg(domestic_bval, domestic_blot)
+        enriched_row["d_savg_per_share"] = derive_avg(domestic_sval, domestic_slot)
+
+        enriched_rows.append(enriched_row)
+
+    return enriched_rows
+
+
+def fetch_ipot_foreign_rows(
+    source: IPOTSource,
+    ticker: str,
+    date_str: str,
+    all_rows: list[dict],
+) -> list[dict]:
+    try:
+        foreign_rows = source.fetch(
+            ticker,
+            date_str,
+            investor_type="F",
+        )
+
+    except Exception as error:
+        log.warning("  %s: IPOT foreign request failed: %s", ticker, error)
+        return all_rows
+
+    return add_foreign_and_domestic_rows(all_rows, foreign_rows)
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -241,6 +323,13 @@ def cmd_scrape(args):
             for pt in probe_tickers:
                 try:
                     probe = probe_source.fetch(pt, date_str)
+                    if probe and isinstance(probe_source, IPOTSource):
+                        probe = fetch_ipot_foreign_rows(
+                            probe_source,
+                            pt,
+                            date_str,
+                            probe,
+                        )
                     probe_rows.extend(probe)
                 except Exception as e:
                     probe_exceptions.append((pt, type(e).__name__, str(e)[:120]))
@@ -294,9 +383,22 @@ def cmd_scrape(args):
                     continue
 
                 rows, src = fetch_with_fallback(primary, fallback, ticker, date_str)
+
                 if rows:
+                    if src == IPOTSource.name and isinstance(
+                        primary, IPOTSource
+                    ):
+                        rows = fetch_ipot_foreign_rows(
+                            primary,
+                            ticker,
+                            date_str,
+                            rows,
+                        )
+
                     all_rows.extend(rows)
+
                     source_counts[src] = source_counts.get(src, 0) + len(rows)
+
                 else:
                     failed += 1
 

@@ -9,6 +9,10 @@ CSV_COLUMNS = [
     "bfreq", "blot", "bval", "bavg_per_share",
     "sfreq", "slot", "sval", "savg_per_share",
     "nlot", "nval", "navg_per_share",
+    "f_bfreq", "f_blot", "f_bval", "f_bavg_per_share",
+    "d_bavg_per_share",
+    "f_sfreq", "f_slot", "f_sval", "f_savg_per_share",
+    "d_savg_per_share",
 ]
 
 
