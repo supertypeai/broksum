@@ -1,0 +1,12 @@
+description: Debug 
+
+container:
+  image: broksum-runtime:latest
+  pull_policy: never
+  working_dir: /tmp
+
+hist_retention_days: 1
+
+steps:
+  - id: hold
+    run: sh -c 'date; python --version; python -c "import curl_cffi, segno, supabase; print(\"imports ok\")"; sleep 30'
