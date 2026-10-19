@@ -1,5 +1,4 @@
 from datetime import date, datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from scrape import (
@@ -13,9 +12,8 @@ from sources._socketcluster import IPOTAuthError, IPOTConnection, _describe_fram
 from sources.ipot import IPOTSource
 
 import argparse
-import io
 import logging
-import segno
+import shlex
 import threading
 import time
 
@@ -39,8 +37,6 @@ HEARTBEAT_DATE = "2026-10-13"
 SCRAPE_AT = "18:00"
 SCRAPE_RETRY_SECONDS = 60 * 60
 SCRAPE_MAX_ATTEMPTS = 3
-
-QR_IMAGE_PATH = Path("ipot_qr.png")
 
 
 class SessionStats:
@@ -89,17 +85,18 @@ def heartbeat(connection: IPOTConnection) -> int:
 
 
 def show_qrcode(qrcode_text: str, span_seconds: int) -> None:
-    qr_code = segno.make(qrcode_text, error="h")
-
-    terminal_qr = io.StringIO()
-    qr_code.terminal(out=terminal_qr, compact=True)
-    qr_code.save(QR_IMAGE_PATH, scale=8, border=4)
+    # The Dagu log pane can't draw a QR (no block-character font, fixed line
+    # spacing), so log the text and draw it in a local terminal instead
+    draw_command = (
+        "uv run --with segno python -c "
+        "\"import segno, sys; segno.make(sys.argv[1], error='h').terminal(compact=True)\" "
+        + shlex.quote(qrcode_text)
+    )
 
     LOGGER.info(
-        "Scan this QR with the IPOT app within %ds (also saved to %s)\n%s",
+        "Scan within %ds. Draw the QR in a local terminal, then scan it with the IPOT app:\n%s",
         span_seconds,
-        QR_IMAGE_PATH.resolve(),
-        terminal_qr.getvalue(),
+        draw_command,
     )
 
 
@@ -347,10 +344,7 @@ def main() -> int:
     connection = IPOTConnection(autologintoken="unused")
     connection.connect()
 
-    try:
-        connection.qr_login(show_qrcode=show_qrcode)
-    finally:
-        QR_IMAGE_PATH.unlink(missing_ok=True)
+    connection.qr_login(show_qrcode=show_qrcode)
 
     LOGGER.info(
         "QR LOGIN OK at %s | scraping after %s WIB", 

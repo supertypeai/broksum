@@ -19,9 +19,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Playwright is only for auth_bootstrap.py, the one-time login
-# nothing in a container opens a browser, so drop it. segno draws the login QR
-# and is not in requirements.txt
+# nothing in a container opens a browser, so drop it
 COPY requirements.txt /tmp/requirements.txt
 RUN grep -vi '^playwright' /tmp/requirements.txt > /tmp/requirements.container.txt \
-    && pip install --no-cache-dir -r /tmp/requirements.container.txt segno \
+    && pip install --no-cache-dir -r /tmp/requirements.container.txt \
     && rm /tmp/requirements*.txt

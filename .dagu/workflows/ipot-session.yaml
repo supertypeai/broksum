@@ -30,7 +30,7 @@ steps:
     depends: [checkout]
     run: >-
       sh -c "grep -vi '^playwright' requirements.txt > /tmp/requirements.txt
-      && pip install --no-cache-dir -r /tmp/requirements.txt segno tzdata"
+      && pip install --no-cache-dir -r /tmp/requirements.txt tzdata"
 
   - id: hold_session
     depends: [install_deps]
