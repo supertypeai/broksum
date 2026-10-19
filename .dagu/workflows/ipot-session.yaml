@@ -1,9 +1,10 @@
 description: IPOT — hold one logged in session open and scrape the latest trading day once a day. Start by hand and scan the QR in the log, a restart means scanning again.
 
 container:
-  image: broksum-runtime:latest
-  pull_policy: never
+  image: python:3.11-slim
   working_dir: /workspace
+  env:
+    - PYTHONUNBUFFERED: "1"
 
 secrets:
   - SUPABASE_URL
@@ -16,9 +17,21 @@ queue: ipot-session
 hist_retention_days: 7
 
 steps:
+  # The stock image has no git, which `runners clone` needs
+  - id: install_git
+    run: sh -c 'apt-get update && apt-get install -y --no-install-recommends git ca-certificates'
+
   - id: checkout
+    depends: [install_git]
     run: runners clone
 
-  - id: hold_session
+  # tzdata: the slim image has no timezone database for ZoneInfo("Asia/Jakarta")
+  - id: install_deps
     depends: [checkout]
+    run: >-
+      sh -c "grep -vi '^playwright' requirements.txt > /tmp/requirements.txt
+      && pip install --no-cache-dir -r /tmp/requirements.txt segno tzdata"
+
+  - id: hold_session
+    depends: [install_deps]
     run: python ipot_service.py
