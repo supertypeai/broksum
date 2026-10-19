@@ -34,14 +34,21 @@ DEFAULT_CREDS_PATH = Path(__file__).parent.parent / "ipot_creds.json"
 class IPOTSource:
     name = "IPOT"
 
-    def __init__(self, creds_path=None):
+    def __init__(self, creds_path=None, connection: IPOTConnection | None = None):
+        """
+        With `connection`, fetch over that already logged in session instead of
+        logging in from ipot_creds.json, and leave it open on close(), its owner
+        (ipot_service.py) holds it for the day. A second login would end it.
+        """
         self.creds_path = Path(creds_path) if creds_path else DEFAULT_CREDS_PATH
-        if not self.creds_path.exists():
+        self._conn: IPOTConnection | None = connection
+        self._owns_conn = connection is None
+        
+        if connection is None and not self.creds_path.exists():
             raise IPOTAuthError(
                 f"No IPOT creds at {self.creds_path}. "
                 "Run `python auth_bootstrap.py` to create one."
             )
-        self._conn: IPOTConnection | None = None
 
     def _ensure_authenticated(self) -> None:
         if self._conn is not None:
@@ -152,6 +159,6 @@ class IPOTSource:
         return out
 
     def close(self) -> None:
-        if self._conn is not None:
+        if self._conn is not None and self._owns_conn:
             self._conn.close()
-            self._conn = None
+        self._conn = None

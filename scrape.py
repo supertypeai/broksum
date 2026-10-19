@@ -267,7 +267,11 @@ def fetch_ipot_foreign_rows(
 # Commands
 # ---------------------------------------------------------------------------
 
-def cmd_scrape(args):
+def cmd_scrape(args, sources=None):
+    """
+    `sources` is an optional (primary, fallback) pair, ipot_service.py passes one
+    built on its held IPOT session. Without it the sources are built from creds.
+    """
     client = get_supabase()
 
     # Determine symbols (from Sectors idx_company_profile)
@@ -295,7 +299,7 @@ def cmd_scrape(args):
     log.info(f"{len(symbols)} symbols, {len(dates)} trading day(s): {dates[0]} → {dates[-1]}")
 
     DATA_DIR.mkdir(exist_ok=True)
-    primary, fallback = _build_sources()
+    primary, fallback = sources or _build_sources()
     log.info(f"Primary source: {primary.name}" + (f", fallback: {fallback.name}" if fallback else " (no fallback)"))
 
     empty_dates: list[str] = []  # dates that produced 0 rows (probe skip or main-loop empty)

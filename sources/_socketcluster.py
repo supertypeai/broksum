@@ -72,6 +72,30 @@ def _decode_jwt_payload(jwt_str: str) -> dict | None:
         return None
 
 
+def _describe_frame(value, depth: int = 0):
+    """Frame summary for debug logs: secrets and long strings are hidden."""
+    if depth > 6:
+        return "..."
+
+    if isinstance(value, dict):
+        return {
+            key: (
+                "<redacted>"
+                if key in ("token", "lasttoken", "session", "password", "qrcode", "authToken")
+                else _describe_frame(nested_value, depth + 1)
+            )
+            for key, nested_value in value.items()
+        }
+
+    if isinstance(value, list):
+        return [_describe_frame(list_item, depth + 1) for list_item in value[:5]]
+
+    if isinstance(value, str) and len(value) > 60:
+        return f"<str len={len(value)}>"
+
+    return value
+
+
 class IPOTConnection:
     """Single SocketCluster connection: connect, authenticate, send RPCs.
 
@@ -110,8 +134,12 @@ class IPOTConnection:
                 return None
         else:
             text = str(data)
+        if text == "#1":
+            # SocketCluster server ping; answer it or the server drops us
+            # after pingTimeout (matters for long waits like a QR scan)
+            self.ws.send(b"#2")
+            return None
         if not text or text.startswith("#"):
-            # SocketCluster ping/pong (#1 / #2) — ignore
             return None
         try:
             return json.loads(text)
@@ -194,7 +222,7 @@ class IPOTConnection:
 
     # ---- authentication ----
 
-    def authenticate(self) -> None:
+    def authenticate(self, lazy: bool = True) -> None:
         """Run autologin with stored token. On success, persist rotated token."""
         cid = self._next_cid()
         payload = {
@@ -204,7 +232,7 @@ class IPOTConnection:
                 "param": {
                     "cmd": "autologin",
                     "lasttoken": self.autologintoken,
-                    "lazy": True,
+                    "lazy": lazy,
                     "session": self.appsession,
                     "device": DEFAULT_DEVICE,
                 },
@@ -234,6 +262,28 @@ class IPOTConnection:
                         raise IPOTAuthError(f"autologin rejected: {d['errmsg']}")
                     success = True
                     break
+            elif obj.get("rid") == cid:
+                # lazy=false: IPOT answers in the direct reply instead of a record
+                log.debug(f"autologin direct reply: {_describe_frame(obj)}")
+
+                if obj.get("error"):
+                    raise IPOTAuthError(f"autologin rejected: {obj['error']}")
+
+                reply_data = obj.get("data")
+
+                if not isinstance(reply_data, dict) or reply_data.get("status") == "HOLD":
+                    continue
+
+                if "errmsg" in reply_data:
+                    raise IPOTAuthError(f"autologin rejected: {reply_data['errmsg']}")
+
+                reply_result = reply_data.get("result") or {}
+
+                if reply_result.get("status") not in (None, "OK"):
+                    raise IPOTAuthError(f"autologin rejected: {_describe_frame(reply_result)}")
+
+                success = True
+                break
             else:
                 # Buffer non-auth records (notifs, other channels) — we don't need them
                 pass
@@ -241,10 +291,126 @@ class IPOTConnection:
         if not success:
             raise IPOTAuthError("autologin timed out before record reply")
 
+        # The rotated token can arrive just after the reply; give it a moment
+        token_deadline = time.time() + 3
+
+        while new_token is None and time.time() < token_deadline:
+            obj = self._recv_obj()
+
+            if obj and obj.get("event") == "#setAuthToken":
+                jwt = (obj.get("data") or {}).get("token")
+                payload_decoded = _decode_jwt_payload(jwt) if jwt else None
+
+                if payload_decoded:
+                    new_token = payload_decoded.get("token")
+
         if new_token:
             self.autologintoken = new_token
         self._authenticated = True
         log.info("IPOT autologin OK; token rotated")
+
+    def qr_login(self, show_qrcode, max_qr_attempts: int = 3, lazy: bool = True) -> None:
+        """
+        Log this connection in by QR, the same way the desktop web app does.
+
+        Sends `login` with `cmd:"getqr"` IPOT replies with a QR string valid
+        for `span` seconds. `show_qrcode(qrcode_text, span_seconds)` must
+        display it so a human can scan it with the IPOT mobile app. After the
+        scan, IPOT pushes `#setAuthToken` (and a record for our cmdid) on this
+        same connection, so no token has to be copied anywhere.
+        """
+        for qr_attempt in range(1, max_qr_attempts + 1):
+            command_id = self._next_cid()
+
+            self._send_obj({
+                "event": "login",
+                "data": {
+                    "cmdid": command_id,
+                    "param": {
+                        "cmd": "getqr",
+                        "lazy": lazy,
+                        "session": self.appsession,
+                        "device": DEFAULT_DEVICE,
+                    },
+                },
+                "cid": command_id,
+            })
+
+            received_auth_token = False
+            deadline = time.time() + HANDSHAKE_TIMEOUT_S
+
+            while time.time() < deadline:
+                message = self._recv_obj()
+
+                if message is None:
+                    continue
+
+                event_name = message.get("event")
+
+                if event_name == "notif":
+                    continue
+
+                log.debug(f"QR login frame: {_describe_frame(message)}")
+
+                if event_name == "#setAuthToken":
+                    jwt_token = (message.get("data") or {}).get("token")
+                    jwt_payload = _decode_jwt_payload(jwt_token) if jwt_token else None
+
+                    if jwt_payload and jwt_payload.get("token"):
+                        self.autologintoken = jwt_payload["token"]
+
+                    received_auth_token = True
+                    # The login record usually follows right away
+                    deadline = min(deadline, time.time() + 5)
+                    continue
+
+                # With lazy=true IPOT answers HOLD and sends the QR as a
+                # `record` with lazy=false it puts the QR in the direct
+                # reply (rid == our cid). Accept both shapes
+                is_direct_reply = message.get("rid") == command_id
+
+                if event_name != "record" and not is_direct_reply:
+                    continue
+
+                record_data = message.get("data") or {}
+
+                if not isinstance(record_data, dict) or record_data.get("cmdid") != command_id:
+                    continue
+
+                if is_direct_reply and record_data.get("status") == "HOLD":
+                    continue
+
+                if "errmsg" in record_data:
+                    raise IPOTAuthError(f"QR login rejected: {record_data['errmsg']}")
+
+                # The reply echoes our request under record.data.data,
+                # with the outcome at record.data.data.result
+                inner_data = record_data.get("data") or {}
+                login_result = inner_data.get("result") or record_data.get("result") or {}
+                result_info = login_result.get("info") or {}
+
+                if result_info.get("qrcode"):
+                    span_seconds = int(result_info.get("span") or 60)
+                    show_qrcode(result_info["qrcode"], span_seconds)
+                    deadline = time.time() + span_seconds + 5
+                    continue
+
+                # Any other record for our cmdid after the QR is the login outcome
+                if login_result.get("status") == "OK" or received_auth_token:
+                    self._authenticated = True
+                    log.info("IPOT QR login OK")
+                    return
+
+                raise IPOTAuthError(f"QR login failed: {_describe_frame(record_data)}")
+
+            if received_auth_token:
+                self._authenticated = True
+                log.info("IPOT QR login OK (auth token received)")
+                return
+
+            log.warning(f"QR code expired without a scan (attempt {qr_attempt}/{max_qr_attempts})")
+
+        raise IPOTAuthError(f"QR login not completed after {max_qr_attempts} QR code(s)")
 
     # ---- RPC ----
 

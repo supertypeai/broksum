@@ -1,15 +1,24 @@
-description: Test Running All Day 
+description: IPOT — hold one logged in session open and scrape the latest trading day once a day. Start by hand and scan the QR in the log, a restart means scanning again.
 
 container:
-  image: python:3.11-slim
-  working_dir: /tmp
+  image: broksum-runtime:latest
+  pull_policy: never
+  working_dir: /workspace
+
+secrets:
+  - SUPABASE_URL
+  - SUPABASE_KEY
 
 # Its own queue, so nothing else waits behind a run that never ends
 queue: ipot-session
 
-# No timeout_sec on purpose: this run is meant to last until stopped
+# No timeout_sec on purpose: ending the run ends the IPOT login
 hist_retention_days: 7
 
 steps:
-  - id: hold
-    run: sh -c 'while true; do date; sleep 60; done'
+  - id: checkout
+    run: runners clone
+
+  - id: hold_session
+    depends: [checkout]
+    run: python ipot_service.py
