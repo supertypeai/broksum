@@ -1,0 +1,15 @@
+description: Test Running All Day 
+
+container:
+  image: python:3.11-slim
+  working_dir: /tmp
+
+# Its own queue, so nothing else waits behind a run that never ends
+queue: ipot-session
+
+# No timeout_sec on purpose: this run is meant to last until stopped
+hist_retention_days: 7
+
+steps:
+  - id: hold
+    run: sh -c 'while true; do date; sleep 60; done'
