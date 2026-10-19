@@ -13,6 +13,7 @@ from sources.ipot import IPOTSource
 
 import argparse
 import logging
+import resource
 import shlex
 import threading
 import time
@@ -49,14 +50,31 @@ class SessionStats:
         self.reconnects_failed = 0
         self.scrapes_ok = 0
         self.longest_silence_seconds = 0.0
+        self.last_wall_seconds = time.time()
+        self.last_cpu_seconds = time.process_time()
 
     def summary(self) -> str:
-        hours_alive = (time.time() - self.started_at) / 3600
+        seconds_alive = time.time() - self.started_at
+        hours_alive = seconds_alive / 3600
+
+        # ru_maxrss is KB on Linux; statm's second field is resident pages
+        peak_memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        with open("/proc/self/statm") as statm:
+            memory_mb = int(statm.read().split()[1]) * resource.getpagesize() / 1024 / 1024
+
+        # CPU since the previous summary, so a scrape shows up as its own window
+        now_wall_seconds = time.time()
+        now_cpu_seconds = time.process_time()
+        window_seconds = max(now_wall_seconds - self.last_wall_seconds, 0.001)
+        cpu_percent = (now_cpu_seconds - self.last_cpu_seconds) / window_seconds * 100
+        self.last_wall_seconds = now_wall_seconds
+        self.last_cpu_seconds = now_cpu_seconds
 
         return (
             f"ran {hours_alive:.2f}h | checks ok={self.checks_ok} failed={self.checks_failed} | "
             f"drops={self.drops} | reconnects ok={self.reconnects_ok} failed={self.reconnects_failed} | "
             f"scrapes ok={self.scrapes_ok} | "
+            f"memory={memory_mb:.0f}MB peak={peak_memory_mb:.0f}MB cpu={cpu_percent:.1f}% last {window_seconds / 60:.0f}min | "
             f"longest gap between frames={self.longest_silence_seconds:.0f}s"
         )
 
