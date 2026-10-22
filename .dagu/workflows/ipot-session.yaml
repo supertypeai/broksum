@@ -5,10 +5,16 @@ container:
   working_dir: /workspace
   env:
     - PYTHONUNBUFFERED: "1"
+    - DEBIAN_FRONTEND: noninteractive
 
 secrets:
   - SUPABASE_URL
   - SUPABASE_KEY
+  - AWS_ACCESS_KEY_ID
+  - AWS_SECRET_ACCESS_KEY
+  - AWS_REGION
+  - SES_FROM_EMAIL
+  - ALERT_TO_EMAIL
 
 # Its own queue, so nothing else waits behind a run that never ends
 queue: ipot-session

@@ -6,3 +6,4 @@ python-dotenv>=1.0.0
 # The daily cron uses curl_cffi (no browser).
 playwright>=1.45.0
 curl_cffi>=0.15.0
+boto3

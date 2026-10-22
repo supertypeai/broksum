@@ -1,5 +1,7 @@
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
+from email.message import EmailMessage
+from dotenv import load_dotenv
 
 from scrape import (
     DATA_DIR,
@@ -13,11 +15,15 @@ from sources.ipot import IPOTSource
 
 import argparse
 import logging
+import os
 import resource
 import shlex
 import threading
 import time
+import boto3 
 
+
+load_dotenv()
 
 LOGGER = logging.getLogger("ipot_service")
 
@@ -25,8 +31,15 @@ WIB = ZoneInfo("Asia/Jakarta")
 
 CHECK_INTERVAL_SECONDS = 5 * 60
 
-# No frame at all (not even a ping) for this long = treat the connection as dead
-SILENCE_LIMIT_SECONDS = 90
+# No frame at all (not even a ping) for this long = treat the connection as dead.
+# The longest normal gap seen over 67h was 45s
+SILENCE_LIMIT_SECONDS = 60
+
+# The token only lives a few seconds after its session ends, so retry fast
+# and give up once it is surely dead
+RECONNECT_WINDOW_SECONDS = 15
+RECONNECT_RETRY_WAIT_SECONDS = 2
+RECONNECT_REQUEST_TIMEOUT_SECONDS = 5
 
 # Anything else from the server gets logged
 ROUTINE_EVENTS = ("notif", "record")
@@ -118,6 +131,47 @@ def show_qrcode(qrcode_text: str, span_seconds: int) -> None:
     )
 
 
+def send_alert(subject: str, body: str) -> None:
+    region = os.getenv("AWS_REGION")
+    access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
+    secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    sender = os.getenv("SES_FROM_EMAIL")
+    recipients = os.getenv("ALERT_TO_EMAIL")
+
+    if not (
+        region and 
+        access_key_id and 
+        secret_access_key and 
+        sender and 
+        recipients
+    ):
+        LOGGER.warning("ALERT NOT SENT (SES env vars missing): %s", subject)
+        return
+
+    try:
+        message = EmailMessage()
+        message["Subject"] = f"[IPOT service] {subject}"
+        message["From"] = sender
+        message["To"] = recipients
+        message.set_content(body)
+
+        response = boto3.client(
+            "ses",
+            region_name=region,
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+        ).send_raw_email(
+            Source=sender,
+            Destinations=[address.strip() for address in recipients.split(",")],
+            RawMessage={"Data": message.as_string()},
+        )
+
+        LOGGER.info("ALERT SENT (%s): %s", response.get("MessageId"), subject)
+
+    except Exception as error:
+        LOGGER.error("ALERT FAILED: %s: %s | %s", type(error).__name__, error, subject)
+
+
 def reconnect(
     old_connection: IPOTConnection | None,
     latest_token: str,
@@ -126,22 +180,53 @@ def reconnect(
     Open + handshake the new connection first, then close the old one, then
     log in immediately: the token can't be used while its session is open and
     only lives a few seconds after that session ends.
+
+    Retries for RECONNECT_WINDOW_SECONDS to ride out a short network glitch,
+    then raises: after that the token is dead and only a new QR scan helps.
     """
-    new_connection = IPOTConnection(autologintoken=latest_token)
-    new_connection.connect()
+    started_at = time.time()
+    attempt = 0
 
-    if old_connection is not None:
-        old_connection.close()
+    while True:
+        attempt += 1
+        new_connection = IPOTConnection(autologintoken=latest_token)
+        new_connection.request_timeout_seconds = RECONNECT_REQUEST_TIMEOUT_SECONDS
 
-    login_started_at = time.time()
-    new_connection.authenticate()
+        try:
+            new_connection.connect()
 
-    LOGGER.info(
-        "RECONNECT OK: autologin %.2fs after old session closed",
-        time.time() - login_started_at,
-    )
+            if old_connection is not None:
+                old_connection.close()
 
-    return new_connection
+            login_started_at = time.time()
+            new_connection.authenticate()
+
+        except Exception as error:
+            new_connection.close()
+            elapsed_seconds = time.time() - started_at
+
+            if elapsed_seconds + RECONNECT_RETRY_WAIT_SECONDS >= RECONNECT_WINDOW_SECONDS:
+                raise
+
+            LOGGER.warning(
+                "RECONNECT ATTEMPT %d failed after %.0fs (%s: %s) | retrying",
+                attempt,
+                elapsed_seconds,
+                type(error).__name__,
+                error,
+            )
+            time.sleep(RECONNECT_RETRY_WAIT_SECONDS)
+            continue
+
+        new_connection.request_timeout_seconds = None
+
+        LOGGER.info(
+            "RECONNECT OK (attempt %d): autologin %.2fs after old session closed",
+            attempt,
+            time.time() - login_started_at,
+        )
+
+        return new_connection
 
 
 class SilenceWatchdog:
@@ -274,6 +359,18 @@ def already_uploaded(date_str: str) -> bool:
     return bool(response.data)
 
 
+def alert_if_out_of_attempts(date_str: str, schedule: ScrapeSchedule, reason: str) -> None:
+    if schedule.attempts[date_str] < SCRAPE_MAX_ATTEMPTS:
+        return
+
+    send_alert(
+        f"Scrape failed for {date_str}",
+        f"All {SCRAPE_MAX_ATTEMPTS} attempts for {date_str} failed. Last result: {reason}\n"
+        f"The session is still running. Check the Dagu log; if {date_str} was a market holiday "
+        f"this is expected, otherwise backfill it.",
+    )
+
+
 def scrape_day(
     target: date,
     connection: IPOTConnection,
@@ -335,10 +432,12 @@ def scrape_day(
             exit_signal.code,
             SCRAPE_MAX_ATTEMPTS,
         )
+        alert_if_out_of_attempts(date_str, schedule, f"no rows (exit {exit_signal.code})")
         return
 
     except Exception as error:
         LOGGER.error("SCRAPE FAILED: %s: %s", type(error).__name__, error)
+        alert_if_out_of_attempts(date_str, schedule, f"{type(error).__name__}: {error}")
         return
 
     finally:
@@ -421,6 +520,13 @@ def main() -> int:
                         reconnect_error,
                         stats.summary(),
                     )
+                    send_alert(
+                        "Session lost, QR scan needed",
+                        f"The IPOT connection dropped and could not be recovered "
+                        f"({type(reconnect_error).__name__}: {reconnect_error}).\n"
+                        f"The service has stopped. Restart the ipot-session DAG and scan the QR "
+                        f"in its log. No scrape runs until then.\n\n{stats.summary()}",
+                    )
                     return 1
 
     except KeyboardInterrupt:
@@ -429,6 +535,11 @@ def main() -> int:
     except IPOTAuthError as error:
         stats.reconnects_failed += 1
         LOGGER.error("AUTH FAILED: %s | %s", error, stats.summary())
+        send_alert(
+            "Login failed, QR scan needed",
+            f"IPOT rejected the login ({error}).\nThe service has stopped. "
+            f"Restart the ipot-session DAG and scan the QR in its log.\n\n{stats.summary()}",
+        )
         return 1
 
     finally:

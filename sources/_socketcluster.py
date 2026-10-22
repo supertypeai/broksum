@@ -111,6 +111,8 @@ class IPOTConnection:
         self.ws = None
         self._cid = 0
         self._authenticated = False
+        # Overrides the per-request timeouts while warming up (None = defaults)
+        self.request_timeout_seconds: float | None = None
         # Buffer of frames received during one logical exchange but not for
         # the cid we were waiting for. We re-process them on the next call.
         self._spillover: list[dict] = []
@@ -156,11 +158,11 @@ class IPOTConnection:
         a non-empty token.
         """
         assert self.sess is not None
-        self.sess.get(HOMEPAGE, timeout=20)
+        self.sess.get(HOMEPAGE, timeout=self.request_timeout_seconds or 20)
         asset_headers = {"Referer": HOMEPAGE, "Sec-Fetch-Site": "same-origin"}
         for url in WARM_ASSETS:
             try:
-                self.sess.get(url, headers=asset_headers, timeout=15)
+                self.sess.get(url, headers=asset_headers, timeout=self.request_timeout_seconds or 15)
             except Exception:
                 pass
         r = self.sess.get(
@@ -172,7 +174,7 @@ class IPOTConnection:
                 "Sec-Fetch-Site": "same-origin",
                 "Accept": "*/*",
             },
-            timeout=20,
+            timeout=self.request_timeout_seconds or 20,
         )
         text = r.text
         if "appsession='" in text:
