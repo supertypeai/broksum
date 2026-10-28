@@ -1,11 +1,11 @@
 description: IPOT — hold one logged in session open and scrape the latest trading day once a day. Start by hand and scan the QR in the log, a restart means scanning again.
 
+# Not -slim: the full image ships git (which `runners clone` needs), so no apt step at start
 container:
-  image: python:3.11-slim
+  image: python:3.11
   working_dir: /workspace
   env:
     - PYTHONUNBUFFERED: "1"
-    - DEBIAN_FRONTEND: noninteractive
 
 secrets:
   - SUPABASE_URL
@@ -23,15 +23,10 @@ queue: ipot-session
 hist_retention_days: 7
 
 steps:
-  # The stock image has no git, which `runners clone` needs
-  - id: install_git
-    run: sh -c 'apt-get update && apt-get install -y --no-install-recommends git ca-certificates'
-
   - id: checkout
-    depends: [install_git]
     run: runners clone
 
-  # tzdata: the slim image has no timezone database for ZoneInfo("Asia/Jakarta")
+  # tzdata: makes sure ZoneInfo("Asia/Jakarta") resolves whatever the image ships
   - id: install_deps
     depends: [checkout]
     run: >-
