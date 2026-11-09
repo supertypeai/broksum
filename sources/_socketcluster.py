@@ -16,8 +16,10 @@ to update this file to match.
 import base64
 import json
 import logging
+import re
 import time
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 from curl_cffi.requests import Session
 
@@ -26,23 +28,99 @@ log = logging.getLogger(__name__)
 WSS_URL = "wss://ipotapp.ipot.id/socketcluster/?appsession={appsession}"
 HOMEPAGE = "https://www.indopremier.com/"
 APPSESSION_URL = "https://www.indopremier.com/ipc/appsession.js"
-CHROME_IMPERSONATE = "chrome146"
+WS_ORIGIN = "https://www.indopremier.com"
 
-# Asset URLs that IPOT's SPA loads on boot. Pre-fetching them with the right
-# Referer/Sec-Fetch-* headers gets us a non-empty appsession token from
-# /ipc/appsession.js (the server returns empty for "naked" requests).
-WARM_ASSETS = (
-    "https://www.indopremier.com/app/css/app.css?v=20260226",
-    "https://www.indopremier.com/app/js/socketcluster.js?v=20251008",
-    "https://www.indopremier.com/app/js/index.js?v=20251205",
-    "https://www.indopremier.com/app/lib/socketcluster-client/socketcluster.min.js",
-    "https://www.indopremier.com/app/lib/md5/dist/md5.min.js",
-)
+# One browser identity everywhere. The TLS fingerprint comes from
+# CHROME_IMPERSONATE, so the User-Agent and sec-ch-ua versions must match it,
+# and the platform must match DEFAULT_DEVICE (Windows desktop) below.
+# When bumping CHROME_IMPERSONATE, copy the new sec-ch-ua value from curl_cffi
+CHROME_IMPERSONATE = "chrome146"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 )
+SEC_CH_UA = '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"'
+SEC_CH_UA_MOBILE = "?0"
+SEC_CH_UA_PLATFORM = '"Windows"'
+ACCEPT_ENCODING = "gzip, deflate, br, zstd"
+ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+
+ACCEPT_DOCUMENT = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,"
+    "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+)
+ACCEPT_STYLESHEET = "text/css,*/*;q=0.1"
+ACCEPT_SCRIPT = "*/*"
+
+# The SPA's <link rel=stylesheet> and <script src> tags, in document order.
+# Loading them like the browser does (the server returns an empty appsession
+# from /ipc/appsession.js for "naked" requests)
+PAGE_ASSET_PATTERN = re.compile(
+    r"<link\b[^>]*\brel=[\"']stylesheet[\"'][^>]*\bhref=[\"']([^\"']+)[\"']"
+    r"|<script\b[^>]*\bsrc=[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
+
+
+def _document_headers() -> dict[str, str]:
+    """
+    Headers of a typed-URL page load, in Chrome's HTTP/1.1 wire order.
+    """
+    return {
+        "Connection": "keep-alive",
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": USER_AGENT,
+        "Accept": ACCEPT_DOCUMENT,
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-User": "?1",
+        "Sec-Fetch-Dest": "document",
+        "Accept-Encoding": ACCEPT_ENCODING,
+        "Accept-Language": ACCEPT_LANGUAGE,
+    }
+
+
+def _subresource_headers(destination: str, accept: str) -> dict[str, str]:
+    """
+    Headers of a same-origin <link>/<script> load, in Chrome's wire order.
+    """
+    return {
+        "Connection": "keep-alive",
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
+        "User-Agent": USER_AGENT,
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "Accept": accept,
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Dest": destination,
+        "Referer": HOMEPAGE,
+        "Accept-Encoding": ACCEPT_ENCODING,
+        "Accept-Language": ACCEPT_LANGUAGE,
+    }
+
+
+def _websocket_headers() -> dict[str, str]:
+    """
+    Headers of Chrome's WebSocket upgrade (no client hints, no Sec-Fetch-*).
+
+    curl adds Host, Upgrade, Connection and Sec-WebSocket-Key/Version itself.
+    Sec-WebSocket-Extensions is left out on purpose: curl can't inflate
+    permessage-deflate frames, so offering it would break the stream if the
+    server accepted
+    """
+    return {
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+        "User-Agent": USER_AGENT,
+        "Origin": WS_ORIGIN,
+        "Accept-Encoding": ACCEPT_ENCODING,
+        "Accept-Language": ACCEPT_LANGUAGE,
+    }
 
 DEFAULT_DEVICE = {
     "desktop": True,
@@ -150,40 +228,72 @@ class IPOTConnection:
             return None
 
     # ---- session warmup + WS connect ----
-
     def _warm_session(self) -> str:
-        """Pre-fetch SPA assets, return a fresh appsession token.
+        """
+        Load the IPOT page the way Chrome does, return a fresh appsession token.
 
-        Must be called before opening the WS so /ipc/appsession.js returns
-        a non-empty token.
+        Fetches the homepage, then every same-origin stylesheet and script it
+        references in document order (appsession.js is one of them). Must run
+        before opening the WS so /ipc/appsession.js returns a non-empty token.
         """
         assert self.sess is not None
-        self.sess.get(HOMEPAGE, timeout=self.request_timeout_seconds or 20)
-        asset_headers = {"Referer": HOMEPAGE, "Sec-Fetch-Site": "same-origin"}
-        for url in WARM_ASSETS:
-            try:
-                self.sess.get(url, headers=asset_headers, timeout=self.request_timeout_seconds or 15)
-            except Exception:
-                pass
-        r = self.sess.get(
-            APPSESSION_URL,
-            headers={
-                "Referer": HOMEPAGE,
-                "Sec-Fetch-Dest": "script",
-                "Sec-Fetch-Mode": "no-cors",
-                "Sec-Fetch-Site": "same-origin",
-                "Accept": "*/*",
-            },
+
+        homepage_response = self.sess.get(
+            HOMEPAGE,
+            headers=_document_headers(),
             timeout=self.request_timeout_seconds or 20,
         )
-        text = r.text
-        if "appsession='" in text:
-            return text.split("appsession='", 1)[1].split("'", 1)[0]
+
+        homepage_host = urlparse(HOMEPAGE).netloc
+        appsession_script = ""
+
+        for stylesheet_link, script_link in PAGE_ASSET_PATTERN.findall(homepage_response.text):
+            asset_url = urljoin(HOMEPAGE, stylesheet_link or script_link)
+
+            # Third-party fonts/analytics don't affect the appsession
+            if urlparse(asset_url).netloc != homepage_host:
+                continue
+
+            if stylesheet_link:
+                asset_headers = _subresource_headers("style", ACCEPT_STYLESHEET)
+            else:
+                asset_headers = _subresource_headers("script", ACCEPT_SCRIPT)
+
+            is_appsession = asset_url.split("?", 1)[0] == APPSESSION_URL
+
+            try:
+                asset_response = self.sess.get(
+                    asset_url,
+                    headers=asset_headers,
+                    timeout=self.request_timeout_seconds or 15,
+                )
+            except Exception:
+                if is_appsession:
+                    raise
+                continue
+
+            if is_appsession:
+                appsession_script = asset_response.text
+
+        # The page layout changed and no longer links appsession.js directly
+        if not appsession_script:
+            log.warning("appsession.js not linked from the homepage; fetching it directly")
+
+            appsession_script = self.sess.get(
+                APPSESSION_URL,
+                headers=_subresource_headers("script", ACCEPT_SCRIPT),
+                timeout=self.request_timeout_seconds or 20,
+            ).text
+
+        if "appsession='" in appsession_script:
+            return appsession_script.split("appsession='", 1)[1].split("'", 1)[0]
         return ""
 
     def connect(self) -> None:
         """Open the WS, run SocketCluster handshake. Does not authenticate."""
-        self.sess = Session(impersonate=CHROME_IMPERSONATE)
+        # Every request sets its full header list (see the *_headers helpers):
+        # curl_cffi's defaults make every request look like a page navigation
+        self.sess = Session(impersonate=CHROME_IMPERSONATE, default_headers=False)
         for c in self.cookies:
             try:
                 self.sess.cookies.set(
@@ -199,13 +309,8 @@ class IPOTConnection:
         # fetched one — it's tied to this curl_cffi session's IP/cookies.
         self.appsession = appsession
 
-        ws_headers = {
-            "Origin": "https://www.indopremier.com",
-            "User-Agent": USER_AGENT,
-            "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
-        }
         self.ws = self.sess.ws_connect(
-            WSS_URL.format(appsession=appsession), headers=ws_headers
+            WSS_URL.format(appsession=appsession), headers=_websocket_headers()
         )
 
         # Send #handshake immediately. Server kicks with code 4005 if we
