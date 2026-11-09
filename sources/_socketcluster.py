@@ -133,9 +133,22 @@ HANDSHAKE_TIMEOUT_S = 15
 AUTH_TIMEOUT_S = 20
 RPC_TIMEOUT_S = 30
 
+# IPOT now and then never finishes answering a query. Resending it on the same
+# connection usually works, so try this many times before giving up
+RPC_ATTEMPTS = 3
+RPC_RETRY_WAIT_S = 2
+
 
 class IPOTAuthError(RuntimeError):
     """Raised when IPOT auth fails (expired/invalid token, NEEDLOGIN, TRYAGAINN, etc.)."""
+
+
+class IPOTTimeoutError(RuntimeError):
+    """Raised when a query got no complete answer after every attempt.
+
+    Kept apart from NODATA on purpose: a timeout means "unknown", not
+    "no trades", so callers must not record it as an empty result.
+    """
 
 
 def _decode_jwt_payload(jwt_str: str) -> dict | None:
@@ -191,6 +204,10 @@ class IPOTConnection:
         self._authenticated = False
         # Overrides the per-request timeouts while warming up (None = defaults)
         self.request_timeout_seconds: float | None = None
+        # Called on every frame received, pings included, so a watchdog can
+        # tell a live socket from a dead one even while a query is running
+        self.on_frame = None
+        self.last_rpc_trace: dict = {}
         # Buffer of frames received during one logical exchange but not for
         # the cid we were waiting for. We re-process them on the next call.
         self._spillover: list[dict] = []
@@ -206,6 +223,8 @@ class IPOTConnection:
 
     def _recv_obj(self) -> dict | None:
         f = self.ws.recv()
+        if self.on_frame is not None:
+            self.on_frame()
         data = f[0] if isinstance(f, tuple) else f
         if isinstance(data, bytes):
             try:
@@ -525,11 +544,38 @@ class IPOTConnection:
         """Send a SocketCluster RPC and collect all data records for it.
 
         Returns the list of `record.data.data` payloads streamed back.
-        Stops collecting when server sends the sentinel `recno: -1`.
+        Retries a query that doesn't finish within RPC_TIMEOUT_S, then raises
+        IPOTTimeoutError: a partial answer is never returned as if complete.
         """
         if not self._authenticated:
             raise IPOTAuthError("send_request before authenticate()")
 
+        for attempt in range(1, RPC_ATTEMPTS + 1):
+            rows = self._send_request_once(service=service, cmd=cmd, param=param)
+
+            if rows is not None:
+                return rows
+
+            log.warning(
+                f"RPC {service}/{cmd} did not terminate cleanly within {RPC_TIMEOUT_S}s "
+                f"(attempt {attempt}/{RPC_ATTEMPTS}) | args={param.get('args')} | "
+                f"frames for this query: {self.last_rpc_trace['own_frames']} | "
+                f"other frames: {self.last_rpc_trace['other_events']}"
+            )
+
+            if attempt < RPC_ATTEMPTS:
+                time.sleep(RPC_RETRY_WAIT_S)
+
+        raise IPOTTimeoutError(
+            f"RPC {service}/{cmd} got no complete answer after {RPC_ATTEMPTS} attempts"
+        )
+
+    def _send_request_once(self, service: str, cmd: str, param: dict) -> list[Any] | None:
+        """One RPC attempt. Returns the rows, or None if it didn't finish in time.
+
+        A fresh cid each attempt, so a late answer to an earlier attempt is
+        ignored rather than mixed in.
+        """
         cid = self._next_cid()
         cmdid = cid
         request = {
@@ -551,10 +597,32 @@ class IPOTConnection:
         terminated = False
         deadline = time.time() + RPC_TIMEOUT_S
 
+        # What arrived for this query, to explain a timeout in the log
+        own_frames: list = []
+        other_events: dict[str, int] = {}
+        self.last_rpc_trace = {"own_frames": own_frames, "other_events": other_events}
+
         while time.time() < deadline and not terminated:
             obj = self._recv_obj()
             if obj is None:
                 continue
+
+            data_field = obj.get("data")
+            is_own_frame = obj.get("rid") == cid or (
+                obj.get("event") == "record"
+                and isinstance(data_field, dict)
+                and data_field.get("cmdid") == cmdid
+            )
+
+            if is_own_frame:
+                # First few and the latest are enough to see the shape
+                if len(own_frames) < 4:
+                    own_frames.append(_describe_frame(obj))
+                else:
+                    own_frames[-1] = _describe_frame(obj)
+            else:
+                event_key = str(obj.get("event") or f"rid={obj.get('rid')}")
+                other_events[event_key] = other_events.get(event_key, 0) + 1
 
             if obj.get("rid") == cid and not ack_seen:
                 rdata = obj.get("data")
@@ -587,7 +655,7 @@ class IPOTConnection:
                     rows.append(inner)
 
         if not terminated:
-            log.warning(f"RPC {service}/{cmd} did not terminate cleanly within {RPC_TIMEOUT_S}s")
+            return None
         return rows
 
     # ---- cleanup ----

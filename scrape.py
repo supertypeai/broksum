@@ -38,6 +38,11 @@ log = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent / "data"
 RETRY_DELAYS = [5, 15, 45]
+
+# After all tickers are scraped, failed ones are retried this many times,
+# waiting this long before each try
+RECOVERY_PASSES = 2
+RECOVERY_WAIT_SECONDS = 60
 INTEGER_COLUMNS = (
     "bfreq", "blot", "bval", "sfreq", "slot", "sval", "nlot", "nval",
     "f_bfreq", "f_blot", "f_bval", "f_sfreq", "f_slot", "f_sval",
@@ -172,24 +177,31 @@ def _build_sources():
 
 
 def fetch_with_fallback(primary, fallback, ticker, date_str):
-    """Try primary → fallback. Returns (rows, source_name)."""
+    """Try primary → fallback. Returns (rows, source_name, errored).
+
+    errored is True when no rows came back because a request failed, as
+    opposed to the ticker having no trades: only those are worth retrying.
+    """
+    errored = False
     try:
         rows = primary.fetch(ticker, date_str)
         if rows:
-            return rows, primary.name
+            return rows, primary.name, False
         log.warning(f"  {ticker}: {primary.name} returned 0 rows")
     except NotImplementedError:
         # IPOT phase-1 skeleton — silently fall through
         pass
     except Exception as e:
+        errored = True
         log.warning(f"  {ticker}: {primary.name} failed: {e}")
     if fallback is not None:
         try:
             rows = fallback.fetch(ticker, date_str)
-            return rows, fallback.name
+            return rows, fallback.name, errored and not rows
         except Exception as e:
+            errored = True
             log.warning(f"  {ticker}: {fallback.name} also failed: {e}")
-    return [], None
+    return [], None, errored
 
 
 def add_foreign_and_domestic_rows(
@@ -248,7 +260,9 @@ def fetch_ipot_foreign_rows(
     ticker: str,
     date_str: str,
     all_rows: list[dict],
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
+    """Returns (rows, foreign_ok). On failure the foreign/domestic columns
+    stay empty (unknown), never zero."""
     try:
         foreign_rows = source.fetch(
             ticker,
@@ -258,9 +272,28 @@ def fetch_ipot_foreign_rows(
 
     except Exception as error:
         log.warning("  %s: IPOT foreign request failed: %s", ticker, error)
-        return all_rows
+        return all_rows, False
 
-    return add_foreign_and_domestic_rows(all_rows, foreign_rows)
+    return add_foreign_and_domestic_rows(all_rows, foreign_rows), True
+
+
+def wait_keeping_session(source, seconds: float) -> None:
+    """Wait without letting an IPOT session time out: keep reading frames so
+    the server's pings get answered (a plain sleep would leave them unanswered)."""
+    connection = getattr(source, "_conn", None)
+
+    if connection is None or connection.ws is None:
+        time.sleep(seconds)
+        return
+
+    until = time.time() + seconds
+
+    try:
+        while time.time() < until:
+            connection._recv_obj()
+    except Exception as error:
+        # The retries after this will fail fast and stay listed as failed
+        log.warning(f"  connection lost while waiting to retry: {type(error).__name__}: {error}")
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +361,7 @@ def cmd_scrape(args, sources=None):
                 try:
                     probe = probe_source.fetch(pt, date_str)
                     if probe and isinstance(probe_source, IPOTSource):
-                        probe = fetch_ipot_foreign_rows(
+                        probe, _ = fetch_ipot_foreign_rows(
                             probe_source,
                             pt,
                             date_str,
@@ -377,44 +410,91 @@ def cmd_scrape(args, sources=None):
 
             # Probe rows came from the primary source — keep them. Fetch the rest
             # via fetch_with_fallback so any per-ticker IPOT failure falls back to IQPlus.
-            all_rows = list(probe_rows)
-            failed = 0
-            source_counts = {primary.name: len(probe_rows)}
+            rows_by_ticker: dict[str, tuple[list[dict], str]] = {}
 
-            for i, symbol in enumerate(symbols, 1):
-                ticker = symbol.replace(".JK", "").upper()
-                if ticker in probe_tickers:
-                    continue
+            # Tickers whose request failed (not "no trades"), and tickers whose
+            # rows came back without foreign data. Both are retried at the end
+            failed_tickers: set[str] = set()
+            missing_foreign: set[str] = set()
 
-                rows, src = fetch_with_fallback(primary, fallback, ticker, date_str)
+            def scrape_ticker(ticker: str) -> None:
+                rows, src, errored = fetch_with_fallback(primary, fallback, ticker, date_str)
+                foreign_ok = True
+
+                if rows and src == IPOTSource.name and isinstance(primary, IPOTSource):
+                    rows, foreign_ok = fetch_ipot_foreign_rows(primary, ticker, date_str, rows)
+
+                failed_tickers.discard(ticker)
+                missing_foreign.discard(ticker)
 
                 if rows:
-                    if src == IPOTSource.name and isinstance(
-                        primary, IPOTSource
-                    ):
-                        rows = fetch_ipot_foreign_rows(
-                            primary,
-                            ticker,
-                            date_str,
-                            rows,
-                        )
+                    # Replaces an earlier, worse result for this ticker
+                    rows_by_ticker[ticker] = (rows, src)
 
-                    all_rows.extend(rows)
+                    if not foreign_ok:
+                        missing_foreign.add(ticker)
 
-                    source_counts[src] = source_counts.get(src, 0) + len(rows)
+                elif errored and ticker in rows_by_ticker:
+                    # A retry failed: keep the earlier rows, still without foreign
+                    missing_foreign.add(ticker)
 
-                else:
-                    failed += 1
+                elif errored:
+                    failed_tickers.add(ticker)
+
+            scrape_tickers = [
+                symbol.replace(".JK", "").upper()
+                for symbol in symbols
+                if symbol.replace(".JK", "").upper() not in probe_tickers
+            ]
+
+            for i, ticker in enumerate(scrape_tickers, 1):
+                scrape_ticker(ticker)
 
                 if i % 50 == 0:
-                    log.info(f"  [{i}/{len(symbols)}] {len(all_rows)} rows so far, {failed} failed")
+                    rows_so_far = len(probe_rows) + sum(len(rows) for rows, _ in rows_by_ticker.values())
+                    log.info(f"  [{i}/{len(scrape_tickers)}] {rows_so_far} rows so far, {len(failed_tickers)} failed")
 
                 time.sleep(args.delay + random.uniform(0, args.jitter))
+
+            # IPOT sometimes stops answering a query for a few minutes, so retry
+            # what failed once everything else is done
+            for recovery_pass in range(1, RECOVERY_PASSES + 1):
+                retry_tickers = sorted(failed_tickers | missing_foreign)
+
+                if not retry_tickers:
+                    break
+
+                log.info(
+                    f"  RECOVERY {recovery_pass}/{RECOVERY_PASSES}: retrying {len(retry_tickers)} "
+                    f"ticker(s) in {RECOVERY_WAIT_SECONDS}s: {', '.join(retry_tickers)}"
+                )
+                wait_keeping_session(primary, RECOVERY_WAIT_SECONDS)
+
+                for ticker in retry_tickers:
+                    scrape_ticker(ticker)
+                    time.sleep(args.delay + random.uniform(0, args.jitter))
+
+            all_rows = list(probe_rows)
+            source_counts = {primary.name: len(probe_rows)}
+
+            for rows, src in rows_by_ticker.values():
+                all_rows.extend(rows)
+                source_counts[src] = source_counts.get(src, 0) + len(rows)
+
+            failed = len(failed_tickers)
+            failed_tickers = sorted(failed_tickers)
+            missing_foreign = sorted(missing_foreign)
 
             if all_rows:
                 path = write_csv(date_str, all_rows)
                 src_summary = ", ".join(f"{k}={v}" for k, v in source_counts.items() if v)
                 log.info(f"  {date_str} done — {len(all_rows)} rows → {path} ({failed} failed; sources: {src_summary})")
+
+                # Still failing after the recovery passes: backfill these
+                if failed_tickers:
+                    log.warning(f"  {date_str} FAILED (request error, no rows) for: {', '.join(failed_tickers)}")
+                if missing_foreign:
+                    log.warning(f"  {date_str} foreign data missing (request failed) for: {', '.join(missing_foreign)}")
             else:
                 log.error(
                     f"::error::no rows scraped for {date_str} ({failed} ticker failures). "

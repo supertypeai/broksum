@@ -252,6 +252,10 @@ class SilenceWatchdog:
             self.connection = connection
             self.last_frame_at = time.time()
 
+        # Every frame counts, including those read while a query runs: a slow
+        # query used to look like silence and got a live socket closed
+        connection.on_frame = self.frame_received
+
     def pause(self) -> None:
         with self.lock:
             self.paused = True
@@ -306,7 +310,6 @@ def idle(
             raise ConnectionError("socket closed")
 
         message = connection._recv_obj()
-        watchdog.frame_received()
 
         if message is None:
             continue
@@ -471,15 +474,17 @@ def main() -> int:
 
     watchdog.watch(connection)
 
-    try:
-        broker_count = heartbeat(connection)
-        LOGGER.info("CHECK OK right after login: %d brokers", broker_count)
-        stats.checks_ok += 1
+    # The first check runs inside the loop so a failure there reconnects
+    # instead of ending the service (and the login with it)
+    first_check = True
 
+    try:
         while True:
             try:
-                idle(connection, CHECK_INTERVAL_SECONDS, watchdog)
+                if not first_check:
+                    idle(connection, CHECK_INTERVAL_SECONDS, watchdog)
 
+                first_check = False
                 broker_count = heartbeat(connection)
 
                 if broker_count > 0:
