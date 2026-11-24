@@ -37,6 +37,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent / "data"
+# One-ticker canary for the IQPlus source. The backfill short-circuits when the table
+# looks current, which used to make a dead source look like a healthy run.
+PROBE_TICKER = "BBCA"
 RETRY_DELAYS = [5, 15, 45]
 
 # After all tickers are scraped, failed ones are retried this many times,
@@ -137,7 +140,15 @@ def _is_transient_5xx(err: Exception) -> bool:
     return any(code in s for code in ("502", "503", "504", "Bad gateway", "Bad Gateway"))
 
 
-def batch_upsert(client, rows: list[dict], batch_size: int = 500) -> int:
+def batch_upsert(client, rows: list[dict], batch_size: int = 500, insert_only: bool = False) -> int:
+    """Insert rows, or upsert over them.
+
+    insert_only sends `Prefer: resolution=ignore-duplicates` (ON CONFLICT DO
+    NOTHING), so an existing row is never modified. IQPlus backfill uploads use
+    it: the fallback cannot reproduce every broker and carries no trade
+    frequency, so letting it overwrite an IPOT row would silently blank bfreq/
+    sfreq and replace a full day with a 10-broker slice.
+    """
     if not rows:
         return 0
     total = 0
@@ -146,7 +157,9 @@ def batch_upsert(client, rows: list[dict], batch_size: int = 500) -> int:
         for attempt in range(3):
             try:
                 client.table("idx_broker_summary_daily").upsert(
-                    batch, on_conflict="symbol,date,broker_code"
+                    batch,
+                    on_conflict="symbol,date,broker_code",
+                    ignore_duplicates=insert_only,
                 ).execute()
                 break
             except Exception as e:
@@ -157,7 +170,8 @@ def batch_upsert(client, rows: list[dict], batch_size: int = 500) -> int:
                 else:
                     raise
         total += len(batch)
-        log.info(f"Upserted {total}/{len(rows)} rows")
+        # insert-only returns only the rows that landed, so this counts sent rows.
+        log.info(f"Sent {total}/{len(rows)} rows{' (insert-only)' if insert_only else ''}")
     return total
 
 
@@ -416,6 +430,10 @@ def cmd_scrape(args, sources=None):
             # rows came back without foreign data. Both are retried at the end
             failed_tickers: set[str] = set()
             missing_foreign: set[str] = set()
+            # Tickers the fallback had to cover. IQPlus only publishes its top-10
+            # ranked brokers (buyers only), so these rows are not a full day and
+            # a later backfill cannot repair them (it fills missing dates only).
+            partial_tickers: set[str] = set()
 
             def scrape_ticker(ticker: str) -> None:
                 rows, src, errored = fetch_with_fallback(primary, fallback, ticker, date_str)
@@ -430,6 +448,10 @@ def cmd_scrape(args, sources=None):
                 if rows:
                     # Replaces an earlier, worse result for this ticker
                     rows_by_ticker[ticker] = (rows, src)
+                    if src != primary.name:
+                        partial_tickers.add(ticker)
+                    else:
+                        partial_tickers.discard(ticker)
 
                     if not foreign_ok:
                         missing_foreign.add(ticker)
@@ -495,6 +517,12 @@ def cmd_scrape(args, sources=None):
                     log.warning(f"  {date_str} FAILED (request error, no rows) for: {', '.join(failed_tickers)}")
                 if missing_foreign:
                     log.warning(f"  {date_str} foreign data missing (request failed) for: {', '.join(missing_foreign)}")
+                if partial_tickers:
+                    log.warning(
+                        f"  {date_str} PARTIAL for {len(partial_tickers)} ticker(s) — "
+                        f"{fallback.name} top-10 ranking only, not the full broker list, "
+                        f"and no later run refills a dated row: {', '.join(sorted(partial_tickers))}"
+                    )
             else:
                 log.error(
                     f"::error::no rows scraped for {date_str} ({failed} ticker failures). "
@@ -521,6 +549,8 @@ def cmd_scrape(args, sources=None):
 def cmd_upload(args):
     client = get_supabase()
     DATA_DIR.mkdir(exist_ok=True)
+    # ipot_service.py calls this with a Namespace(date=...) only
+    insert_only = getattr(args, "insert_only", False)
 
     if args.date:
         files = [DATA_DIR / f"{args.date}.csv"]
@@ -540,8 +570,8 @@ def cmd_upload(args):
         if not rows:
             log.info(f"{path.name}: empty, skipping")
             continue
-        log.info(f"Uploading {path.name} ({len(rows)} rows) ...")
-        n = batch_upsert(client, rows)
+        log.info(f"Uploading {path.name} ({len(rows)} rows){' (insert-only)' if insert_only else ''} ...")
+        n = batch_upsert(client, rows, insert_only=insert_only)
         total += n
 
     log.info(f"Upload complete — {total} rows across {len(files)} file(s)")
@@ -817,6 +847,31 @@ def cmd_normalize_registry(args):
     log.info(f"Normalized {updates}/{len(rows)} rows")
 
 
+def probe_iqplus(probe_dates):
+    """Fetch one ticker so a green run proves the source works, not just that the
+    table looked current. IQPlus can lag by a session, so accept any of the dates
+    offered before calling the source dead. Raises SystemExit(1) when none answer."""
+    last_error = None
+    source = IQPlusSource()
+    try:
+        for probe_date in probe_dates:
+            try:
+                rows = source.fetch(PROBE_TICKER, probe_date.isoformat())
+            except Exception as error:
+                last_error = f"{type(error).__name__}: {error}"
+                continue
+            if rows:
+                log.info(f"IQPlus probe ok: {len(rows)} broker rows for {PROBE_TICKER} on {probe_date}")
+                return len(rows)
+            last_error = f"0 broker rows for {PROBE_TICKER} on {probe_date}"
+    finally:
+        source.close()
+
+    log.error(f"::error::IQPlus probe failed for {[str(d) for d in probe_dates]} — "
+              f"source is dead, refusing a silent no-op ({last_error})")
+    raise SystemExit(1)
+
+
 def cmd_backfill_iqplus(args):
     """T+1 IQPlus backfill — fill any gap between idx_broker_summary_daily and
     idx_daily_data via the auth-less IQPlus source.
@@ -853,6 +908,13 @@ def cmd_backfill_iqplus(args):
     daily_max = date.fromisoformat(daily_max_resp.data[0]["date"])
     log.info(f"idx_broker_summary_daily latest: {broksum_max}")
     log.info(f"idx_daily_data latest:           {daily_max}")
+
+    # Probe before the freshness short-circuit: IQPlus could be answering 404/500
+    # for weeks while every run logged "Nothing to backfill" and exited 0.
+    previous_day = daily_max - timedelta(days=1)
+    while previous_day.weekday() >= 5:
+        previous_day -= timedelta(days=1)
+    probe_iqplus([daily_max, previous_day])
 
     if broksum_max >= daily_max:
         log.info("Nothing to backfill — broksum is current.")
@@ -903,6 +965,25 @@ def cmd_backfill_iqplus(args):
                     log.info(f"  [{i}/{len(symbols)}] {len(all_rows)} rows so far, {failed} failed")
                 time.sleep(delay + random.uniform(0, jitter))
 
+            # Second pass: each broker's top tickers, to refill the pairs the
+            # per-ticker top-10 ranking leaves out. ~88 requests for the whole day.
+            have = {(r["symbol"], r["broker_code"]) for r in all_rows}
+            extra = iqplus.fetch_broker_pass(
+                date_str,
+                {r["broker_code"] for r in all_rows},
+                delay=delay + random.uniform(0, jitter),
+                only_symbols=set(symbols),
+            )
+            added = 0
+            for row in extra:
+                if (row["symbol"], row["broker_code"]) in have:
+                    continue
+                have.add((row["symbol"], row["broker_code"]))
+                all_rows.append(row)
+                added += 1
+            if added:
+                log.info(f"  broker pass added {added} pairs the per-ticker pass missed")
+
             if all_rows:
                 path = write_csv(date_str, all_rows)
                 log.info(f"  {date_str} done — {len(all_rows)} rows → {path} ({failed} ticker failures)")
@@ -946,6 +1027,11 @@ def main():
 
     up = sub.add_parser("upload", help="Upload CSVs to Supabase")
     up.add_argument("--date", help="Upload only this date's CSV")
+    up.add_argument(
+        "--insert-only",
+        action="store_true",
+        help="Insert missing (symbol,date,broker_code) rows only; never modify existing rows",
+    )
 
     reg = sub.add_parser(
         "registry",

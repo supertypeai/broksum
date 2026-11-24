@@ -5,6 +5,33 @@ Scrapes IDX per-broker daily buy/sell/net per ticker into Supabase
 
 1. **IPOT** (IndoPremier) — primary. Login-gated, full broker list, server-side date aggregation.
 2. **IQPlus** — public HTML fallback (no auth). Used automatically when IPOT fails. Lower coverage; it's a safety net, not a replacement.
+   Source page: `net_buy_sell.php` (nav BROKSUM), two query shapes over the same six columns
+   (`Broker/Code | B.Lot | B.Avg | S.Lot | S.Avg | N.Lot`):
+   `scode=<TICKER>&tab=broker` (that ticker's top brokers) and `scode=<BROKER>&tab=stock` (that broker's top tickers).
+   - Hard cap of **10 rows per list**, no request param lifts it. Per-ticker pass alone ⇒ 10 brokers/ticker;
+     `--backfill-iqplus` then runs a per-broker pass (~88 requests/day) that refills missed pairs
+     (measured +40–110% rows on some tickers, +0 on others, plus tickers nobody asked for).
+   - **No trade frequency** any more: `bfreq`/`sfreq` land as NULL (the column is nullable).
+   - Values are rebuilt as `lot*100*avg` from the page's exact `data-sort` floats. Verified against
+     IPOT rows already in Supabase: 152/152 rows identical on blot/bval/slot/sval/nlot/nval and the
+     three avg columns.
+   - The table is ordered by **net descending**, so it is net buyers only: zero seller rows for a
+     liquid name. Every seller/counterparty/frequency view on the site (`heatmap.php?api=broker`,
+     `ajax_flow=1`, `FLOW_INIT_SELLERS`, `broker_flow.php?api=1`) is pinned to the latest session —
+     date params are ignored or fall back to a preset window — so none of them can fill a gap date.
+   - `--backfill-iqplus` writes the CSVs, and the workflow uploads them with
+     **`upload --insert-only`** (`Prefer: resolution=ignore-duplicates`): missing
+     (symbol,date,broker_code) rows are inserted, existing rows are never modified. A fallback day
+     therefore cannot blank an IPOT row's `bfreq`/`sfreq` or replace real numbers with a 10-broker slice.
+     The per-broker pass is also restricted to `idx_company_profile` symbols (the reverse table lists
+     warrants such as `BBCANG`, which would otherwise become fake `*.JK` symbols).
+   - History is a **rolling ~365 days** (2025-11-24 onwards on 2026-11-24); older dates return empty.
+   - The page 403s on `HeadlessChrome` user agents — plain requests/curl are fine, only headless
+     browsers get blocked.
+
+   IDX's own `primary/TradingSummary/GetBrokerSummary` is **not** a substitute: it is per-broker
+   aggregate only (`Volume`, `Value`, `Frequency`, 88 brokers, no per-stock dimension). Reachable
+   with `curl_cffi` impersonating `firefox133` when needed, but it cannot fill this table.
 
 Everything below is about **IPOT**, since that's the only part that needs a human.
 

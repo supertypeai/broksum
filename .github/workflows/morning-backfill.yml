@@ -36,7 +36,7 @@ jobs:
           for f in data/*.csv; do
             [ -e "$f" ] || continue
             DATE=$(basename "$f" .csv)
-            python scrape.py upload --date "$DATE"
+            python scrape.py upload --date "$DATE" --insert-only
           done
 
       - name: Upload CSV artifact (debug)

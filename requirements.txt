@@ -1,6 +1,8 @@
 requests>=2.31.0
 beautifulsoup4>=4.12.0
-supabase>=2.0.0
+# supabase>=2.10 pulls postgrest>=0.16, which is where upsert(ignore_duplicates=) lands.
+# `scrape.py upload --insert-only` depends on it.
+supabase>=2.10.0
 python-dotenv>=1.0.0
 # Playwright is only used by auth_bootstrap.py (one-time human QR login).
 # The daily cron uses curl_cffi (no browser).
